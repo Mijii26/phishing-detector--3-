@@ -1,0 +1,152 @@
+/* Styles for content script elements */
+.phishing-detector-loading {
+  position: absolute !important;
+  top: 5px !important;
+  right: 5px !important;
+  z-index: 9999 !important;
+}
+
+.phishing-detector-result {
+  position: absolute !important;
+  top: 5px !important;
+  right: 5px !important;
+  z-index: 9999 !important;
+}
+
+.phishing-detector-modal {
+  position: fixed !important;
+  top: 0 !important;
+  left: 0 !important;
+  width: 100% !important;
+  height: 100% !important;
+  background: rgba(0, 0, 0, 0.5) !important;
+  z-index: 999999 !important;
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+}
+
+.phishing-detector-modal > div {
+  background: white !important;
+  border-radius: 8px !important;
+  padding: 20px !important;
+  max-width: 500px !important;
+  width: 90% !important;
+  max-height: 80% !important;
+  overflow-y: auto !important;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3) !important;
+}
+
+/* Gmail specific styles */
+.gmail .phishing-detector-result,
+.gmail .phishing-detector-loading {
+  position: absolute !important;
+  top: 10px !important;
+  right: 10px !important;
+}
+
+/* Outlook specific styles */
+.outlook .phishing-detector-result,
+.outlook .phishing-detector-loading {
+  position: absolute !important;
+  top: 5px !important;
+  right: 15px !important;
+}
+
+/* Animation for loading indicator */
+@keyframes pulse {
+  0% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.5;
+  }
+  100% {
+    opacity: 1;
+  }
+}
+
+.phishing-detector-loading > div {
+  animation: pulse 1.5s infinite !important;
+}
+
+/* Top-of-screen banner for PhishNet */
+.phishnet-banner {
+  position: fixed !important;
+  top: 0 !important;
+  left: 0 !important;
+  width: 100% !important;
+  z-index: 2147483646 !important; /* near max */
+  display: flex !important;
+  align-items: center !important;
+  justify-content: space-between !important;
+  box-sizing: border-box !important;
+  padding: 14px 16px !important;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif !important;
+  color: #fff !important;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25) !important;
+  animation: phishnet-slide-down 200ms ease-out !important;
+}
+
+.phishnet-banner--safe {
+  background: #15803d !important; /* green-700 */
+}
+
+.phishnet-banner--warn {
+  background: #dc2626 !important; /* red-600 */
+}
+
+.phishnet-banner__text {
+  display: flex !important;
+  align-items: center !important;
+  gap: 10px !important;
+  font-size: 14px !important;
+  line-height: 1.25 !important;
+}
+
+.phishnet-banner__badge {
+  font-weight: 700 !important;
+  padding: 4px 8px !important;
+  border-radius: 9999px !important;
+  background: rgba(255, 255, 255, 0.2) !important;
+}
+
+.phishnet-banner__actions {
+  display: flex !important;
+  align-items: center !important;
+  gap: 8px !important;
+}
+
+.phishnet-banner__btn {
+  background: rgba(255, 255, 255, 0.15) !important;
+  color: #fff !important;
+  border: 1px solid rgba(255, 255, 255, 0.25) !important;
+  padding: 6px 10px !important;
+  border-radius: 6px !important;
+  cursor: pointer !important;
+  font-size: 12px !important;
+}
+
+.phishnet-banner__btn:hover {
+  background: rgba(255, 255, 255, 0.25) !important;
+}
+
+.phishnet-banner__close {
+  background: transparent !important;
+  border: none !important;
+  color: #fff !important;
+  font-size: 18px !important;
+  cursor: pointer !important;
+  padding: 4px !important;
+  line-height: 1 !important;
+}
+
+/* Slide-down animation for PhishNet banner */
+@keyframes phishnet-slide-down {
+  from {
+    transform: translateY(-100%);
+  }
+  to {
+    transform: translateY(0);
+  }
+}
