@@ -6,3 +6,4 @@ textstat==0.7.3
 language-tool-python==2.7.1
 tldextract==3.6.0
 setuptools>=65.0.0
+python-dotenv==1.0.1

@@ -14,6 +14,7 @@ from datetime import datetime, timedelta
 
 import hashlib
 import os
+from dotenv import load_dotenv
 
 # Handle textstat import with fallback
 try:
@@ -52,6 +53,9 @@ try:
     WHOIS_AVAILABLE = True
 except Exception:
     WHOIS_AVAILABLE = False
+
+# Load .env early so env vars are available
+load_dotenv()
 
 app = Flask(__name__)
 CORS(app)
