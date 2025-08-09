@@ -14,6 +14,7 @@ from datetime import datetime, timedelta
 
 import hashlib
 import os
+from dotenv import load_dotenv
 
 # Handle textstat import with fallback
 try:
@@ -52,6 +53,9 @@ try:
     WHOIS_AVAILABLE = True
 except Exception:
     WHOIS_AVAILABLE = False
+
+# Load .env early so env vars are available
+load_dotenv()
 
 app = Flask(__name__)
 CORS(app)
@@ -165,6 +169,35 @@ class PhishingDetector:
 
     def _domain_age_days(self, domain: str) -> int | None:
         if not WHOIS_AVAILABLE or not domain:
+            # Try WhoisXML fallback if available
+            api_key = os.getenv('WHOISXML_KEY') or os.getenv('WHOISXMLAPI_KEY')
+            if not api_key:
+                return None
+            try:
+                resp = requests.get(
+                    "https://www.whoisxmlapi.com/whoisserver/WhoisService",
+                    params={
+                        "apiKey": api_key,
+                        "domainName": domain,
+                        "outputFormat": "JSON"
+                    }, timeout=8
+                )
+                if resp.ok:
+                    data = resp.json()
+                    created = (
+                        data.get("WhoisRecord", {}).get("createdDate") or
+                        data.get("WhoisRecord", {}).get("registryData", {}).get("createdDate")
+                    )
+                    if created:
+                        try:
+                            # created can be like '2000-01-01T00:00:00Z' or '2000-01-01 00:00:00'
+                            created_str = str(created).replace('Z', '').replace('T', ' ')
+                            dt = datetime.fromisoformat(created_str)
+                            return (datetime.utcnow() - dt).days
+                        except Exception:
+                            pass
+            except Exception:
+                pass
             return None
         try:
             w = whois.whois(domain)
@@ -172,9 +205,65 @@ class PhishingDetector:
             if isinstance(created, list):
                 created = min([d for d in created if isinstance(d, datetime)], default=None)
             if not isinstance(created, datetime):
+                # Try WhoisXML fallback if available
+                api_key = os.getenv('WHOISXML_KEY') or os.getenv('WHOISXMLAPI_KEY')
+                if not api_key:
+                    return None
+                try:
+                    resp = requests.get(
+                        "https://www.whoisxmlapi.com/whoisserver/WhoisService",
+                        params={
+                            "apiKey": api_key,
+                            "domainName": domain,
+                            "outputFormat": "JSON"
+                        }, timeout=8
+                    )
+                    if resp.ok:
+                        data = resp.json()
+                        created = (
+                            data.get("WhoisRecord", {}).get("createdDate") or
+                            data.get("WhoisRecord", {}).get("registryData", {}).get("createdDate")
+                        )
+                        if created:
+                            try:
+                                created_str = str(created).replace('Z', '').replace('T', ' ')
+                                dt = datetime.fromisoformat(created_str)
+                                return (datetime.utcnow() - dt).days
+                            except Exception:
+                                return None
+                except Exception:
+                    return None
                 return None
             return (datetime.utcnow() - created.replace(tzinfo=None)).days
         except Exception:
+            # Try WhoisXML as fallback on whois errors
+            api_key = os.getenv('WHOISXML_KEY') or os.getenv('WHOISXMLAPI_KEY')
+            if not api_key:
+                return None
+            try:
+                resp = requests.get(
+                    "https://www.whoisxmlapi.com/whoisserver/WhoisService",
+                    params={
+                        "apiKey": api_key,
+                        "domainName": domain,
+                        "outputFormat": "JSON"
+                    }, timeout=8
+                )
+                if resp.ok:
+                    data = resp.json()
+                    created = (
+                        data.get("WhoisRecord", {}).get("createdDate") or
+                        data.get("WhoisRecord", {}).get("registryData", {}).get("createdDate")
+                    )
+                    if created:
+                        try:
+                            created_str = str(created).replace('Z', '').replace('T', ' ')
+                            dt = datetime.fromisoformat(created_str)
+                            return (datetime.utcnow() - dt).days
+                        except Exception:
+                            return None
+            except Exception:
+                return None
             return None
 
     def _has_spf(self, domain: str) -> bool:
@@ -184,6 +273,7 @@ class PhishingDetector:
                 v = ''.join([b.decode('utf-8') if isinstance(b, (bytes, bytearray)) else str(b) for b in r.strings]) if hasattr(r, 'strings') else str(r)
                 if 'v=spf1' in v.lower():
                     return True
+             
         except Exception:
             pass
         return False
@@ -231,7 +321,9 @@ class PhishingDetector:
     def _check_external_reputation(self, url: str, domain: str) -> tuple[int, list[str]]:
         # Optional integrations you can enable by setting env vars:
         # - GOOGLE_SAFE_BROWSING_KEY
-        # - URLSCAN_API_KEY
+        # - URLHAUS_ENABLED (set to 1/true to enable)
+        # - PHISHTANK_APP_KEY
+        # - VT_API_KEY or VIRUSTOTAL_API_KEY
         score_adj = 0
         issues = []
         gsb_key = os.getenv('GOOGLE_SAFE_BROWSING_KEY')
@@ -255,7 +347,126 @@ class PhishingDetector:
                     issues.append("Flagged by Google Safe Browsing")
             except Exception:
                 pass
-        # You can extend with urlscan.io quick reputation, PhishTank, etc.
+        
+        # URLHaus (no key required) - enable via URLHAUS_ENABLED env var
+        try:
+            urlhaus_enabled = os.getenv('URLHAUS_ENABLED', '').lower() in ('1', 'true', 'yes', 'on')
+            if urlhaus_enabled:
+                resp = requests.post(
+                    "https://urlhaus-api.abuse.ch/v1/url/",
+                    data={"url": url}, timeout=6
+                )
+                if resp.ok:
+                    data = resp.json()
+                    if data.get("query_status") == "ok":
+                        threat = (data.get("threat") or "").lower()
+                        url_status = (data.get("url_status") or "").lower()
+                        if threat in ("phishing", "malware", "malicious") or url_status in ("online", "offline"):
+                            score_adj -= 50
+                            issues.append(f"Flagged by URLHaus ({threat or 'malicious'})")
+        except Exception:
+            pass
+
+        # PhishTank (requires API key)
+        pt_key = os.getenv('PHISHTANK_APP_KEY')
+        if pt_key:
+            try:
+                resp = requests.post(
+                    "https://checkurl.phishtank.com/checkurl/",
+                    data={
+                        "url": url,
+                        "format": "json",
+                        "app_key": pt_key
+                    },
+                    headers={"User-Agent": "phishnet/1.0"},
+                    timeout=8
+                )
+                if resp.ok:
+                    results = resp.json().get("results", {})
+                    in_db = results.get("in_database")
+                    valid = str(results.get("valid", False)).lower() == "true"
+                    verified = str(results.get("verified", False)).lower() == "true"
+                    if in_db and valid and verified:
+                        score_adj -= 50
+                        issues.append("Flagged by PhishTank")
+            except Exception:
+                pass
+
+        # VirusTotal URL intelligence (optional)
+        vt_key = os.getenv('VT_API_KEY') or os.getenv('VIRUSTOTAL_API_KEY')
+        if vt_key:
+            try:
+                import base64
+                url_id = base64.urlsafe_b64encode(url.encode()).decode().strip("=")
+                resp = requests.get(
+                    f"https://www.virustotal.com/api/v3/urls/{url_id}",
+                    headers={"x-apikey": vt_key}, timeout=8
+                )
+                if resp.ok:
+                    data = resp.json()
+                    stats = data.get("data", {}).get("attributes", {}).get("last_analysis_stats", {})
+                    if stats.get("malicious", 0) >= 1:
+                        score_adj -= 40
+                        issues.append(f"VirusTotal: {stats.get('malicious', 0)} engines flagged")
+                    elif stats.get("suspicious", 0) >= 1:
+                        score_adj -= 20
+                        issues.append("VirusTotal: flagged as suspicious")
+            except Exception:
+                pass
+
+        # AbuseIPDB reputation (optional; only if domain is IP)
+        abuseipdb_key = os.getenv('ABUSEIPDB_KEY') or os.getenv('ABUSEIPDB_API_KEY')
+        if abuseipdb_key and self._is_ip(domain):
+            try:
+                resp = requests.get(
+                    "https://api.abuseipdb.com/api/v2/check",
+                    params={"ipAddress": domain, "maxAgeInDays": 90},
+                    headers={"Key": abuseipdb_key, "Accept": "application/json"},
+                    timeout=8
+                )
+                if resp.ok:
+                    data = resp.json().get("data", {})
+                    abuse_score = int(data.get("abuseConfidenceScore", 0))
+                    if abuse_score >= 25:
+                        score_adj -= min(30, abuse_score // 2)
+                        issues.append(f"AbuseIPDB: abuse score {abuse_score}")
+            except Exception:
+                pass
+
+        # urlscan.io quick reputation/lookup (optional)
+        urlscan_key = os.getenv('URLSCAN_API_KEY') or os.getenv('URLSCAN_KEY')
+        if urlscan_key:
+            try:
+                # Try a recent search by URL
+                search = requests.get(
+                    "https://urlscan.io/api/v1/search/",
+                    params={"q": f"page.url:{url}"},
+                    headers={"API-Key": urlscan_key}, timeout=8
+                )
+                if search.ok:
+                    results = search.json().get("results", [])
+                    if results:
+                        # If any result is malicious in verdicts
+                        for r in results[:3]:
+                            v = (r.get("verdicts") or {}).get("overall") or {}
+                            if v.get("malicious"):
+                                score_adj -= 40
+                                issues.append("urlscan.io: previous scan marked malicious")
+                                break
+                # Optionally submit a scan in background if nothing found (do not block)
+                if not issues:
+                    try:
+                        requests.post(
+                            "https://urlscan.io/api/v1/scan/",
+                            headers={"API-Key": urlscan_key, "Content-Type": "application/json"},
+                            json={"url": url, "visibility": "private"}, timeout=4
+                        )
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        # You can extend with urlscan.io quick reputation, etc.
         return score_adj, issues
     
     def check_domain_reputation(self, domain: str) -> tuple[int, list[str]]:

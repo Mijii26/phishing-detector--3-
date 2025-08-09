@@ -256,6 +256,25 @@ EXPOSE 5000
 CMD ["python", "app.py"]
 \`\`\`
 
+## Environment variables (.env)
+
+Create a `.env` file in the project root (same directory as `app.py`) and add the keys you want to enable:
+
+```
+cp .env.example .env
+# edit .env
+```
+
+Supported variables:
+- `VT_API_KEY` or `VIRUSTOTAL_API_KEY`: VirusTotal API key
+- `ABUSEIPDB_KEY` or `ABUSEIPDB_API_KEY`: AbuseIPDB key
+- `WHOISXML_KEY` or `WHOISXMLAPI_KEY`: WhoisXML key
+- `URLSCAN_API_KEY` or `URLSCAN_KEY`: urlscan.io key
+- `GOOGLE_SAFE_BROWSING_KEY`: Google Safe Browsing key
+- `URLHAUS_ENABLED`: set to `1` or `true` to enable URLHaus lookups
+
+The backend automatically loads `.env` via `python-dotenv`.
+
 ## 🤝 Contributing
 
 We welcome contributions! Please follow these guidelines:
