@@ -231,7 +231,9 @@ class PhishingDetector:
     def _check_external_reputation(self, url: str, domain: str) -> tuple[int, list[str]]:
         # Optional integrations you can enable by setting env vars:
         # - GOOGLE_SAFE_BROWSING_KEY
-        # - URLSCAN_API_KEY
+        # - URLHAUS_ENABLED (set to 1/true to enable)
+        # - PHISHTANK_APP_KEY
+        # - VT_API_KEY or VIRUSTOTAL_API_KEY
         score_adj = 0
         issues = []
         gsb_key = os.getenv('GOOGLE_SAFE_BROWSING_KEY')
@@ -255,7 +257,74 @@ class PhishingDetector:
                     issues.append("Flagged by Google Safe Browsing")
             except Exception:
                 pass
-        # You can extend with urlscan.io quick reputation, PhishTank, etc.
+        
+        # URLHaus (no key required) - enable via URLHAUS_ENABLED env var
+        try:
+            urlhaus_enabled = os.getenv('URLHAUS_ENABLED', '').lower() in ('1', 'true', 'yes', 'on')
+            if urlhaus_enabled:
+                resp = requests.post(
+                    "https://urlhaus-api.abuse.ch/v1/url/",
+                    data={"url": url}, timeout=6
+                )
+                if resp.ok:
+                    data = resp.json()
+                    if data.get("query_status") == "ok":
+                        threat = (data.get("threat") or "").lower()
+                        url_status = (data.get("url_status") or "").lower()
+                        if threat in ("phishing", "malware", "malicious") or url_status in ("online", "offline"):
+                            score_adj -= 50
+                            issues.append(f"Flagged by URLHaus ({threat or 'malicious'})")
+        except Exception:
+            pass
+
+        # PhishTank (requires API key)
+        pt_key = os.getenv('PHISHTANK_APP_KEY')
+        if pt_key:
+            try:
+                resp = requests.post(
+                    "https://checkurl.phishtank.com/checkurl/",
+                    data={
+                        "url": url,
+                        "format": "json",
+                        "app_key": pt_key
+                    },
+                    headers={"User-Agent": "phishnet/1.0"},
+                    timeout=8
+                )
+                if resp.ok:
+                    results = resp.json().get("results", {})
+                    in_db = results.get("in_database")
+                    valid = str(results.get("valid", False)).lower() == "true"
+                    verified = str(results.get("verified", False)).lower() == "true"
+                    if in_db and valid and verified:
+                        score_adj -= 50
+                        issues.append("Flagged by PhishTank")
+            except Exception:
+                pass
+
+        # VirusTotal URL intelligence (optional)
+        vt_key = os.getenv('VT_API_KEY') or os.getenv('VIRUSTOTAL_API_KEY')
+        if vt_key:
+            try:
+                import base64
+                url_id = base64.urlsafe_b64encode(url.encode()).decode().strip("=")
+                resp = requests.get(
+                    f"https://www.virustotal.com/api/v3/urls/{url_id}",
+                    headers={"x-apikey": vt_key}, timeout=8
+                )
+                if resp.ok:
+                    data = resp.json()
+                    stats = data.get("data", {}).get("attributes", {}).get("last_analysis_stats", {})
+                    if stats.get("malicious", 0) >= 1:
+                        score_adj -= 40
+                        issues.append(f"VirusTotal: {stats.get('malicious', 0)} engines flagged")
+                    elif stats.get("suspicious", 0) >= 1:
+                        score_adj -= 20
+                        issues.append("VirusTotal: flagged as suspicious")
+            except Exception:
+                pass
+
+        # You can extend with urlscan.io quick reputation, etc.
         return score_adj, issues
     
     def check_domain_reputation(self, domain: str) -> tuple[int, list[str]]:
