@@ -165,6 +165,35 @@ class PhishingDetector:
 
     def _domain_age_days(self, domain: str) -> int | None:
         if not WHOIS_AVAILABLE or not domain:
+            # Try WhoisXML fallback if available
+            api_key = os.getenv('WHOISXML_KEY') or os.getenv('WHOISXMLAPI_KEY')
+            if not api_key:
+                return None
+            try:
+                resp = requests.get(
+                    "https://www.whoisxmlapi.com/whoisserver/WhoisService",
+                    params={
+                        "apiKey": api_key,
+                        "domainName": domain,
+                        "outputFormat": "JSON"
+                    }, timeout=8
+                )
+                if resp.ok:
+                    data = resp.json()
+                    created = (
+                        data.get("WhoisRecord", {}).get("createdDate") or
+                        data.get("WhoisRecord", {}).get("registryData", {}).get("createdDate")
+                    )
+                    if created:
+                        try:
+                            # created can be like '2000-01-01T00:00:00Z' or '2000-01-01 00:00:00'
+                            created_str = str(created).replace('Z', '').replace('T', ' ')
+                            dt = datetime.fromisoformat(created_str)
+                            return (datetime.utcnow() - dt).days
+                        except Exception:
+                            pass
+            except Exception:
+                pass
             return None
         try:
             w = whois.whois(domain)
@@ -172,9 +201,65 @@ class PhishingDetector:
             if isinstance(created, list):
                 created = min([d for d in created if isinstance(d, datetime)], default=None)
             if not isinstance(created, datetime):
+                # Try WhoisXML fallback if available
+                api_key = os.getenv('WHOISXML_KEY') or os.getenv('WHOISXMLAPI_KEY')
+                if not api_key:
+                    return None
+                try:
+                    resp = requests.get(
+                        "https://www.whoisxmlapi.com/whoisserver/WhoisService",
+                        params={
+                            "apiKey": api_key,
+                            "domainName": domain,
+                            "outputFormat": "JSON"
+                        }, timeout=8
+                    )
+                    if resp.ok:
+                        data = resp.json()
+                        created = (
+                            data.get("WhoisRecord", {}).get("createdDate") or
+                            data.get("WhoisRecord", {}).get("registryData", {}).get("createdDate")
+                        )
+                        if created:
+                            try:
+                                created_str = str(created).replace('Z', '').replace('T', ' ')
+                                dt = datetime.fromisoformat(created_str)
+                                return (datetime.utcnow() - dt).days
+                            except Exception:
+                                return None
+                except Exception:
+                    return None
                 return None
             return (datetime.utcnow() - created.replace(tzinfo=None)).days
         except Exception:
+            # Try WhoisXML as fallback on whois errors
+            api_key = os.getenv('WHOISXML_KEY') or os.getenv('WHOISXMLAPI_KEY')
+            if not api_key:
+                return None
+            try:
+                resp = requests.get(
+                    "https://www.whoisxmlapi.com/whoisserver/WhoisService",
+                    params={
+                        "apiKey": api_key,
+                        "domainName": domain,
+                        "outputFormat": "JSON"
+                    }, timeout=8
+                )
+                if resp.ok:
+                    data = resp.json()
+                    created = (
+                        data.get("WhoisRecord", {}).get("createdDate") or
+                        data.get("WhoisRecord", {}).get("registryData", {}).get("createdDate")
+                    )
+                    if created:
+                        try:
+                            created_str = str(created).replace('Z', '').replace('T', ' ')
+                            dt = datetime.fromisoformat(created_str)
+                            return (datetime.utcnow() - dt).days
+                        except Exception:
+                            return None
+            except Exception:
+                return None
             return None
 
     def _has_spf(self, domain: str) -> bool:
@@ -184,6 +269,7 @@ class PhishingDetector:
                 v = ''.join([b.decode('utf-8') if isinstance(b, (bytes, bytearray)) else str(b) for b in r.strings]) if hasattr(r, 'strings') else str(r)
                 if 'v=spf1' in v.lower():
                     return True
+             
         except Exception:
             pass
         return False
@@ -321,6 +407,58 @@ class PhishingDetector:
                     elif stats.get("suspicious", 0) >= 1:
                         score_adj -= 20
                         issues.append("VirusTotal: flagged as suspicious")
+            except Exception:
+                pass
+
+        # AbuseIPDB reputation (optional; only if domain is IP)
+        abuseipdb_key = os.getenv('ABUSEIPDB_KEY') or os.getenv('ABUSEIPDB_API_KEY')
+        if abuseipdb_key and self._is_ip(domain):
+            try:
+                resp = requests.get(
+                    "https://api.abuseipdb.com/api/v2/check",
+                    params={"ipAddress": domain, "maxAgeInDays": 90},
+                    headers={"Key": abuseipdb_key, "Accept": "application/json"},
+                    timeout=8
+                )
+                if resp.ok:
+                    data = resp.json().get("data", {})
+                    abuse_score = int(data.get("abuseConfidenceScore", 0))
+                    if abuse_score >= 25:
+                        score_adj -= min(30, abuse_score // 2)
+                        issues.append(f"AbuseIPDB: abuse score {abuse_score}")
+            except Exception:
+                pass
+
+        # urlscan.io quick reputation/lookup (optional)
+        urlscan_key = os.getenv('URLSCAN_API_KEY') or os.getenv('URLSCAN_KEY')
+        if urlscan_key:
+            try:
+                # Try a recent search by URL
+                search = requests.get(
+                    "https://urlscan.io/api/v1/search/",
+                    params={"q": f"page.url:{url}"},
+                    headers={"API-Key": urlscan_key}, timeout=8
+                )
+                if search.ok:
+                    results = search.json().get("results", [])
+                    if results:
+                        # If any result is malicious in verdicts
+                        for r in results[:3]:
+                            v = (r.get("verdicts") or {}).get("overall") or {}
+                            if v.get("malicious"):
+                                score_adj -= 40
+                                issues.append("urlscan.io: previous scan marked malicious")
+                                break
+                # Optionally submit a scan in background if nothing found (do not block)
+                if not issues:
+                    try:
+                        requests.post(
+                            "https://urlscan.io/api/v1/scan/",
+                            headers={"API-Key": urlscan_key, "Content-Type": "application/json"},
+                            json={"url": url, "visibility": "private"}, timeout=4
+                        )
+                    except Exception:
+                        pass
             except Exception:
                 pass
 
