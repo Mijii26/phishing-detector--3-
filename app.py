@@ -1,294 +1,231 @@
+"""PhishNet - Enhanced version with better data extraction and storage"""
+import os
+import re
+import json
+import time
+import socket
+import random
+import string
+import sqlite3
+import hashlib
+import requests
+import tldextract
+import dns.resolver
+from datetime import datetime
+from urllib.parse import urlparse, unquote
 from flask import Flask, request, jsonify, render_template, send_from_directory
 from flask_cors import CORS
-import sqlite3
-import json
-import re
-import urllib.parse
-from urllib.parse import urlparse  # Add this import
-import requests
-import dns.resolver
-import socket
-import time
-import idna
-from datetime import datetime, timedelta
 
-import hashlib
-import os
-from dotenv import load_dotenv
-
-# Handle textstat import with fallback
+# Optional libs with graceful fallback
 try:
     from textstat import flesch_reading_ease
     TEXTSTAT_AVAILABLE = True
-except ImportError:
-    print("Warning: textstat not available. Reading ease analysis will be skipped.")
+except Exception:
     TEXTSTAT_AVAILABLE = False
     def flesch_reading_ease(text):
-        return 50  # Default neutral score
+        return 50
 
-# Handle language_tool_python import with fallback
 try:
     import language_tool_python
     LANGUAGE_TOOL_AVAILABLE = True
-except ImportError:
-    print("Warning: language_tool_python not available. Grammar checking will be skipped.")
+except Exception:
     LANGUAGE_TOOL_AVAILABLE = False
     class MockLanguageTool:
         def check(self, text):
             return []
         def close(self):
             pass
-    
-    # Create a mock module
     class MockLanguageToolModule:
         def LanguageTool(self, lang):
             return MockLanguageTool()
-    
     language_tool_python = MockLanguageToolModule()
 
-import tldextract
-
 try:
-    import whois  # pip install python-whois
+    import whois
     WHOIS_AVAILABLE = True
 except Exception:
     WHOIS_AVAILABLE = False
 
-# Load .env early so env vars are available
-load_dotenv()
+# Load .env if available
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
-app = Flask(__name__)
-CORS(app)
+# Config
+DEBUG = os.getenv("PHISHNET_DEBUG", "0").lower() in ("1", "true", "yes")
+ENABLE_EXTERNAL_CHECKS = os.getenv("PHISHNET_ENABLE_EXTERNAL", "1").lower() not in ("0", "false", "no")
+DB_PATH = os.getenv("PHISHNET_DB", "data/phishing_detector.db")
+
+# Ensure data directory exists
+os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+
+def log(*args, **kwargs):
+    if DEBUG:
+        print(*args, **kwargs)
+
+# --- Database helpers and schema creation ---
+def get_db_connection():
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def ensure_db():
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    # whitelist table
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS whitelist (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        type TEXT NOT NULL,
+        value TEXT NOT NULL UNIQUE,
+        notes TEXT,
+        added_date DATETIME DEFAULT CURRENT_TIMESTAMP
+    )""")
+    
+    # email_analysis table
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS email_analysis (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        email_id TEXT UNIQUE,
+        sender_email TEXT,
+        sender_domain TEXT,
+        subject TEXT,
+        content_preview TEXT,
+        urls TEXT,
+        score INTEGER,
+        verdict TEXT,
+        analysis_details TEXT,
+        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+    )""")
+    
+    conn.commit()
+    conn.close()
+
+ensure_db()
+
+# --- Unique email ID generator ---
+def generate_unique_email_id(email_data):
+    """Generate a unique ID for each email analysis"""
+    sender = (email_data.get('sender') or '')[:64].replace(' ', '')
+    subj = (email_data.get('subject') or '')[:40].replace(' ', '')
+    ts = datetime.utcnow().strftime("%Y%m%d%H%M%S%f")
+    rand = ''.join(random.choices(string.ascii_lowercase + string.digits, k=6))
+    base = f"{sender}_{subj}_{ts}_{rand}"
+    return hashlib.sha256(base.encode()).hexdigest()
 
 class PhishingDetector:
     def __init__(self):
-        self.db_path = 'data/phishing_detector.db'
+        self.db_path = DB_PATH
+        self.domain_cache = {}
+        self.domain_cache_ttl = 24 * 3600
         
-        # Initialize grammar tool if available
+        # Enhanced phishing patterns
+        self.phishing_patterns = [
+            r'urgent.{0,30}action', r'verify.{0,30}(account|identity|information)',
+            r'suspended.{0,30}account', r'click.{0,30}here', r'limited.{0,30}time',
+            r'congratulations.{0,30}(winner|you)', r'claim.{0,30}prize',
+            r'tax.{0,30}refund', r'security.{0,30}alert', r'unusual.{0,30}activity',
+            r'confirm.{0,30}(identity|account|payment)', r'update.{0,30}(payment|credentials)',
+            r'password.{0,30}reset', r'login.{0,30}now', r'gift.{0,30}card',
+            r'crypto.{0,30}investment', r'wire.{0,30}transfer', r'\b2fa\b.{0,10}disable',
+            r'log in to (your )?account', r'update (your )?account (now|immediately)?'
+        ]
+        
+        self.suspicious_tlds = {'.tk', '.ml', '.ga', '.cf', '.pw', '.top', '.click', '.download'}
+        self.known_brands = {
+            'paypal.com','google.com','microsoft.com','apple.com','amazon.com',
+            'facebook.com','vercel.com','netflix.com','bankofamerica.com','chase.com',
+            'wellsfargo.com','citibank.com','github.com'
+        }
+        self.shorteners = {'bit.ly','tinyurl.com','t.co','goo.gl','ow.ly','is.gd','buff.ly','cutt.ly','rebrand.ly'}
+        
+        # Initialize grammar tool
         if LANGUAGE_TOOL_AVAILABLE:
             try:
                 self.grammar_tool = language_tool_python.LanguageTool('en-US')
-                print("✅ Grammar tool initialized successfully")
+                log("✅ Grammar tool initialized")
             except Exception as e:
-                print(f"Warning: Could not initialize grammar tool: {e}")
+                log("⚠️ Grammar tool init failed:", e)
                 self.grammar_tool = None
         else:
             self.grammar_tool = None
-            print("⚠️ Grammar tool not available - using fallback")
         
-        # Phishing patterns
-        self.phishing_patterns = [
-            r'urgent.{0,20}action.{0,20}required',
-            r'verify.{0,20}account',
-            r'suspended.{0,20}account',
-            r'click.{0,20}here.{0,20}immediately',
-            r'limited.{0,20}time.{0,20}offer',
-            r'congratulations.{0,20}winner',
-            r'claim.{0,20}prize',
-            r'tax.{0,20}refund',
-            r'security.{0,20}alert',
-            r'unusual.{0,20}activity',
-            r'confirm.{0,20}identity',
-            r'update.{0,20}payment',
-            r'expire.{0,20}today',
-            r'act.{0,20}now',
-            r'dear.{0,20}customer',
-            r'dear.{0,20}user',
-            r'password.{0,20}reset',
-            r'login.{0,20}now',
-            r'update.{0,20}credentials',
-            r'bank.{0,20}account',
-            r'confirm.{0,20}payment',
-            r'gift.{0,20}card',
-            r'crypto.{0,20}investment',
-            r'wire.{0,20}transfer',
-            r'2fa.{0,10}disable',
-        ]
-        
-        # Suspicious TLDs
-        self.suspicious_tlds = ['.tk', '.ml', '.ga', '.cf', '.pw', '.top', '.click', '.download']
-        
-        self.known_brands = {
-            'paypal.com', 'google.com', 'microsoft.com', 'apple.com', 'amazon.com',
-            'facebook.com', 'vercel.com', 'netflix.com', 'bankofamerica.com', 'chase.com',
-            'wellsfargo.com', 'citibank.com', 'github.com'
-        }
-        self.shorteners = {'bit.ly','tinyurl.com','t.co','goo.gl','ow.ly','is.gd','buff.ly','cutt.ly','rebrand.ly'}
-        self.domain_cache_ttl = 24 * 3600  # seconds
-        
-    def __del__(self):
-        # Clean up grammar tool
-        if hasattr(self, 'grammar_tool') and self.grammar_tool and LANGUAGE_TOOL_AVAILABLE:
-            try:
-                self.grammar_tool.close()
-            except:
-                pass
-        
-    def get_db_connection(self):
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        return conn
-    
-    def extract_urls(self, text):
-        """Extract URLs from email content"""
-        # Find URLs in plain text
-        urls = re.findall(r'(https?://[^\s<>"\'\)]+)', text)
-        # Also try to capture HTML anchor hrefs if any HTML slipped in
-        hrefs = re.findall(r'href=["\'](https?://[^"\']+)["\']', text, flags=re.IGNORECASE)
-        all_urls = list(set(urls + hrefs))
-        return all_urls
-    
+        # External API keys
+        self.gsb_key = os.getenv('GOOGLE_SAFE_BROWSING_KEY')
+        self.vt_key = os.getenv('VIRUSTOTAL_API_KEY') or os.getenv('VT_API_KEY')
+        self.phishtank_key = os.getenv('PHISHTANK_APP_KEY')
+        self.abuseipdb_key = os.getenv('ABUSEIPDB_KEY') or os.getenv('ABUSEIPDB_API_KEY')
+        self.urlscan_key = os.getenv('URLSCAN_API_KEY') or os.getenv('URLSCAN_KEY')
+        self.urlhaus_enabled = os.getenv('URLHAUS_ENABLED', '').lower() in ('1','true','yes')
+
     def _is_ip(self, host: str) -> bool:
         if not host:
             return False
-        # IPv4
         if re.match(r'^(\d{1,3}\.){3}\d{1,3}$', host):
             return True
-        # IPv6 (basic)
-        return ':' in host
+        return ':' in host and not host.startswith('xn--')
 
     def _lev_ratio(self, a: str, b: str) -> float:
-        # Simple Levenshtein ratio without external deps
-        a, b = a.lower(), b.lower()
+        a, b = (a or '').lower(), (b or '').lower()
         m, n = len(a), len(b)
         if m == 0 or n == 0:
             return 0.0
         dp = [[0]*(n+1) for _ in range(m+1)]
         for i in range(m+1): dp[i][0] = i
         for j in range(n+1): dp[0][j] = j
-        for i in range(1, m+1):
-            for j in range(1, n+1):
+        for i in range(1,m+1):
+            for j in range(1,n+1):
                 cost = 0 if a[i-1] == b[j-1] else 1
-                dp[i][j] = min(
-                    dp[i-1][j] + 1,
-                    dp[i][j-1] + 1,
-                    dp[i-1][j-1] + cost
-                )
+                dp[i][j] = min(dp[i-1][j]+1, dp[i][j-1]+1, dp[i-1][j-1]+cost)
         dist = dp[m][n]
-        return 1.0 - dist / max(m, n)
+        return 1.0 - dist / max(m,n)
 
-    def _domain_age_days(self, domain: str) -> int | None:
-        if not WHOIS_AVAILABLE or not domain:
-            # Try WhoisXML fallback if available
-            api_key = os.getenv('WHOISXML_KEY') or os.getenv('WHOISXMLAPI_KEY')
-            if not api_key:
-                return None
+    def _domain_age_days(self, domain: str):
+        if not domain:
+            return None
+        if WHOIS_AVAILABLE:
             try:
-                resp = requests.get(
-                    "https://www.whoisxmlapi.com/whoisserver/WhoisService",
-                    params={
-                        "apiKey": api_key,
-                        "domainName": domain,
-                        "outputFormat": "JSON"
-                    }, timeout=8
-                )
-                if resp.ok:
-                    data = resp.json()
-                    created = (
-                        data.get("WhoisRecord", {}).get("createdDate") or
-                        data.get("WhoisRecord", {}).get("registryData", {}).get("createdDate")
-                    )
-                    if created:
-                        try:
-                            # created can be like '2000-01-01T00:00:00Z' or '2000-01-01 00:00:00'
-                            created_str = str(created).replace('Z', '').replace('T', ' ')
-                            dt = datetime.fromisoformat(created_str)
-                            return (datetime.utcnow() - dt).days
-                        except Exception:
-                            pass
+                w = whois.whois(domain)
+                created = w.creation_date
+                if isinstance(created, list):
+                    created = min([d for d in created if hasattr(d,'year')], default=None)
+                if hasattr(created,'year'):
+                    return (datetime.utcnow() - created.replace(tzinfo=None)).days
             except Exception:
                 pass
-            return None
-        try:
-            w = whois.whois(domain)
-            created = w.creation_date
-            if isinstance(created, list):
-                created = min([d for d in created if isinstance(d, datetime)], default=None)
-            if not isinstance(created, datetime):
-                # Try WhoisXML fallback if available
-                api_key = os.getenv('WHOISXML_KEY') or os.getenv('WHOISXMLAPI_KEY')
-                if not api_key:
-                    return None
-                try:
-                    resp = requests.get(
-                        "https://www.whoisxmlapi.com/whoisserver/WhoisService",
-                        params={
-                            "apiKey": api_key,
-                            "domainName": domain,
-                            "outputFormat": "JSON"
-                        }, timeout=8
-                    )
-                    if resp.ok:
-                        data = resp.json()
-                        created = (
-                            data.get("WhoisRecord", {}).get("createdDate") or
-                            data.get("WhoisRecord", {}).get("registryData", {}).get("createdDate")
-                        )
-                        if created:
-                            try:
-                                created_str = str(created).replace('Z', '').replace('T', ' ')
-                                dt = datetime.fromisoformat(created_str)
-                                return (datetime.utcnow() - dt).days
-                            except Exception:
-                                return None
-                except Exception:
-                    return None
-                return None
-            return (datetime.utcnow() - created.replace(tzinfo=None)).days
-        except Exception:
-            # Try WhoisXML as fallback on whois errors
-            api_key = os.getenv('WHOISXML_KEY') or os.getenv('WHOISXMLAPI_KEY')
-            if not api_key:
-                return None
-            try:
-                resp = requests.get(
-                    "https://www.whoisxmlapi.com/whoisserver/WhoisService",
-                    params={
-                        "apiKey": api_key,
-                        "domainName": domain,
-                        "outputFormat": "JSON"
-                    }, timeout=8
-                )
-                if resp.ok:
-                    data = resp.json()
-                    created = (
-                        data.get("WhoisRecord", {}).get("createdDate") or
-                        data.get("WhoisRecord", {}).get("registryData", {}).get("createdDate")
-                    )
-                    if created:
-                        try:
-                            created_str = str(created).replace('Z', '').replace('T', ' ')
-                            dt = datetime.fromisoformat(created_str)
-                            return (datetime.utcnow() - dt).days
-                        except Exception:
-                            return None
-            except Exception:
-                return None
-            return None
+        return None
 
     def _has_spf(self, domain: str) -> bool:
         try:
-            txts = dns.resolver.resolve(domain, 'TXT', raise_on_no_answer=False)
-            for r in txts:
-                v = ''.join([b.decode('utf-8') if isinstance(b, (bytes, bytearray)) else str(b) for b in r.strings]) if hasattr(r, 'strings') else str(r)
-                if 'v=spf1' in v.lower():
+            answers = dns.resolver.resolve(domain, 'TXT', raise_on_no_answer=False)
+            for r in answers:
+                try:
+                    txt = ''.join(r.strings).decode('utf-8') if hasattr(r,'strings') else str(r)
+                except Exception:
+                    txt = str(r)
+                if 'v=spf1' in txt.lower():
                     return True
-             
         except Exception:
             pass
         return False
 
-    def _dmarc_policy(self, domain: str) -> str | None:
+    def _dmarc_policy(self, domain: str):
         try:
-            dmarc_domain = f"_dmarc.{domain}"
-            txts = dns.resolver.resolve(dmarc_domain, 'TXT', raise_on_no_answer=False)
-            for r in txts:
-                v = ''.join([b.decode('utf-8') if isinstance(b, (bytes, bytearray)) else str(b) for b in r.strings]) if hasattr(r, 'strings') else str(r)
-                if 'v=dmarc1' in v.lower():
-                    m = re.search(r'\bp=([a-zA-Z]+)', v, re.IGNORECASE)
+            d = f"_dmarc.{domain}"
+            answers = dns.resolver.resolve(d, 'TXT', raise_on_no_answer=False)
+            for r in answers:
+                try:
+                    txt = ''.join(r.strings).decode('utf-8') if hasattr(r,'strings') else str(r)
+                except Exception:
+                    txt = str(r)
+                if 'v=dmarc1' in txt.lower():
+                    m = re.search(r'\bp=([a-zA-Z]+)', txt, re.IGNORECASE)
                     return m.group(1).lower() if m else 'none'
         except Exception:
-            return None
+            pass
         return None
 
     def _mx_exists(self, domain: str) -> bool:
@@ -299,18 +236,16 @@ class PhishingDetector:
             return False
 
     def _looks_punycode(self, domain: str) -> bool:
-        return 'xn--' in domain
+        return 'xn--' in (domain or '')
 
     def _similar_to_brand(self, domain: str) -> bool:
         try:
             ext = tldextract.extract(domain)
-            sld = ext.domain  # second-level label only
-            for brand in self.known_brands:
-                brand_sld = tldextract.extract(brand).domain
-                if sld == brand_sld:
-                    # exact match of SLD is okay only if suffix matches brand's suffix. Otherwise could be typosquat on different TLD.
-                    if f".{ext.suffix}" != f".{tldextract.extract(brand).suffix}":
-                        return True
+            sld = ext.domain
+            for b in self.known_brands:
+                brand_sld = tldextract.extract(b).domain
+                if sld == brand_sld and ext.suffix != tldextract.extract(b).suffix:
+                    return True
                 ratio = self._lev_ratio(sld, brand_sld)
                 if ratio >= 0.85 and sld != brand_sld:
                     return True
@@ -318,628 +253,641 @@ class PhishingDetector:
             pass
         return False
 
-    def _check_external_reputation(self, url: str, domain: str) -> tuple[int, list[str]]:
-        # Optional integrations you can enable by setting env vars:
-        # - GOOGLE_SAFE_BROWSING_KEY
-        # - URLHAUS_ENABLED (set to 1/true to enable)
-        # - PHISHTANK_APP_KEY
-        # - VT_API_KEY or VIRUSTOTAL_API_KEY
+    def _check_external_reputation(self, url: str, domain: str):
         score_adj = 0
         issues = []
-        gsb_key = os.getenv('GOOGLE_SAFE_BROWSING_KEY')
-        if gsb_key:
+        if not ENABLE_EXTERNAL_CHECKS:
+            return score_adj, issues
+
+        # Google Safe Browsing
+        if self.gsb_key:
             try:
                 payload = {
-                    "client": {"clientId": "phishnet", "clientVersion": "1.0"},
-                    "threatInfo": {
-                        "threatTypes": ["MALWARE","SOCIAL_ENGINEERING","UNWANTED_SOFTWARE","POTENTIALLY_HARMFUL_APPLICATION"],
-                        "platformTypes": ["ANY_PLATFORM"],
-                        "threatEntryTypes": ["URL"],
-                        "threatEntries": [{"url": url}]
-                    }
+                    "client":{"clientId":"phishnet","clientVersion":"1.0"},
+                    "threatInfo":{"threatTypes":["MALWARE","SOCIAL_ENGINEERING","UNWANTED_SOFTWARE","POTENTIALLY_HARMFUL_APPLICATION"],
+                                  "platformTypes":["ANY_PLATFORM"], "threatEntryTypes":["URL"],
+                                  "threatEntries":[{"url": url}]}
                 }
-                resp = requests.post(
-                    f"https://safebrowsing.googleapis.com/v4/threatMatches:find?key={gsb_key}",
-                    json=payload, timeout=8
-                )
+                resp = requests.post(f"https://safebrowsing.googleapis.com/v4/threatMatches:find?key={self.gsb_key}", json=payload, timeout=8)
                 if resp.ok and resp.json().get("matches"):
-                    score_adj -= 50
+                    score_adj -= 60
                     issues.append("Flagged by Google Safe Browsing")
             except Exception:
                 pass
-        
-        # URLHaus (no key required) - enable via URLHAUS_ENABLED env var
-        try:
-            urlhaus_enabled = os.getenv('URLHAUS_ENABLED', '').lower() in ('1', 'true', 'yes', 'on')
-            if urlhaus_enabled:
-                resp = requests.post(
-                    "https://urlhaus-api.abuse.ch/v1/url/",
-                    data={"url": url}, timeout=6
-                )
-                if resp.ok:
-                    data = resp.json()
-                    if data.get("query_status") == "ok":
-                        threat = (data.get("threat") or "").lower()
-                        url_status = (data.get("url_status") or "").lower()
-                        if threat in ("phishing", "malware", "malicious") or url_status in ("online", "offline"):
-                            score_adj -= 50
-                            issues.append(f"Flagged by URLHaus ({threat or 'malicious'})")
-        except Exception:
-            pass
 
-        # PhishTank (requires API key)
-        pt_key = os.getenv('PHISHTANK_APP_KEY')
-        if pt_key:
-            try:
-                resp = requests.post(
-                    "https://checkurl.phishtank.com/checkurl/",
-                    data={
-                        "url": url,
-                        "format": "json",
-                        "app_key": pt_key
-                    },
-                    headers={"User-Agent": "phishnet/1.0"},
-                    timeout=8
-                )
-                if resp.ok:
-                    results = resp.json().get("results", {})
-                    in_db = results.get("in_database")
-                    valid = str(results.get("valid", False)).lower() == "true"
-                    verified = str(results.get("verified", False)).lower() == "true"
-                    if in_db and valid and verified:
-                        score_adj -= 50
-                        issues.append("Flagged by PhishTank")
-            except Exception:
-                pass
-
-        # VirusTotal URL intelligence (optional)
-        vt_key = os.getenv('VT_API_KEY') or os.getenv('VIRUSTOTAL_API_KEY')
-        if vt_key:
-            try:
-                import base64
-                url_id = base64.urlsafe_b64encode(url.encode()).decode().strip("=")
-                resp = requests.get(
-                    f"https://www.virustotal.com/api/v3/urls/{url_id}",
-                    headers={"x-apikey": vt_key}, timeout=8
-                )
-                if resp.ok:
-                    data = resp.json()
-                    stats = data.get("data", {}).get("attributes", {}).get("last_analysis_stats", {})
-                    if stats.get("malicious", 0) >= 1:
-                        score_adj -= 40
-                        issues.append(f"VirusTotal: {stats.get('malicious', 0)} engines flagged")
-                    elif stats.get("suspicious", 0) >= 1:
-                        score_adj -= 20
-                        issues.append("VirusTotal: flagged as suspicious")
-            except Exception:
-                pass
-
-        # AbuseIPDB reputation (optional; only if domain is IP)
-        abuseipdb_key = os.getenv('ABUSEIPDB_KEY') or os.getenv('ABUSEIPDB_API_KEY')
-        if abuseipdb_key and self._is_ip(domain):
-            try:
-                resp = requests.get(
-                    "https://api.abuseipdb.com/api/v2/check",
-                    params={"ipAddress": domain, "maxAgeInDays": 90},
-                    headers={"Key": abuseipdb_key, "Accept": "application/json"},
-                    timeout=8
-                )
-                if resp.ok:
-                    data = resp.json().get("data", {})
-                    abuse_score = int(data.get("abuseConfidenceScore", 0))
-                    if abuse_score >= 25:
-                        score_adj -= min(30, abuse_score // 2)
-                        issues.append(f"AbuseIPDB: abuse score {abuse_score}")
-            except Exception:
-                pass
-
-        # urlscan.io quick reputation/lookup (optional)
-        urlscan_key = os.getenv('URLSCAN_API_KEY') or os.getenv('URLSCAN_KEY')
-        if urlscan_key:
-            try:
-                # Try a recent search by URL
-                search = requests.get(
-                    "https://urlscan.io/api/v1/search/",
-                    params={"q": f"page.url:{url}"},
-                    headers={"API-Key": urlscan_key}, timeout=8
-                )
-                if search.ok:
-                    results = search.json().get("results", [])
-                    if results:
-                        # If any result is malicious in verdicts
-                        for r in results[:3]:
-                            v = (r.get("verdicts") or {}).get("overall") or {}
-                            if v.get("malicious"):
-                                score_adj -= 40
-                                issues.append("urlscan.io: previous scan marked malicious")
-                                break
-                # Optionally submit a scan in background if nothing found (do not block)
-                if not issues:
-                    try:
-                        requests.post(
-                            "https://urlscan.io/api/v1/scan/",
-                            headers={"API-Key": urlscan_key, "Content-Type": "application/json"},
-                            json={"url": url, "visibility": "private"}, timeout=4
-                        )
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-
-        # You can extend with urlscan.io quick reputation, etc.
         return score_adj, issues
-    
-    def check_domain_reputation(self, domain: str) -> tuple[int, list[str]]:
-        score = 100
-        issues: list[str] = []
+
+    def check_domain_reputation(self, domain: str):
         if not domain:
             return 40, ["No domain provided"]
+        
+        # Clean domain
+        try:
+            domain = domain.split('@')[-1].split(':')[0].strip().lower()
+        except Exception:
+            domain = str(domain).strip().lower()
+        
+        log(f"🔍 Checking domain reputation for: {domain}")
+        
+        now = time.time()
+        cache = self.domain_cache.get(domain)
+        if cache and (now - cache[2]) < self.domain_cache_ttl:
+            log(f"📋 Using cached result for {domain}")
+            return cache[0], cache[1]
 
-        # Resolve A record
+        score = 100
+        issues = []
+
+        # Check if domain resolves
         try:
             socket.gethostbyname(domain)
             resolves = True
+            log(f"✅ Domain {domain} resolves")
         except Exception:
             resolves = False
+            log(f"❌ Domain {domain} does not resolve")
 
         if not resolves:
             score -= 50
             issues.append("Domain does not resolve")
-            return max(0, score), issues
+            self.domain_cache[domain] = (max(0,score), issues, now)
+            return max(0,score), issues
 
-        # MX presence (mail-ready domains tend to have MX)
+        # Check MX record
         if not self._mx_exists(domain):
-            score -= 15
+            score -= 10
             issues.append("No MX record found")
 
-        # SPF
+        # Check SPF
         if not self._has_spf(domain):
-            score -= 10
+            score -= 8
             issues.append("No SPF record")
 
-        # DMARC
+        # Check DMARC
         policy = self._dmarc_policy(domain)
         if policy is None:
-            score -= 10
+            score -= 8
             issues.append("No DMARC record")
         elif policy == 'none':
-            score -= 5
-            issues.append("DMARC policy is none")
+            score -= 4
+            issues.append("DMARC policy = none")
 
-        # Suspicious attributes
+        # Check TLD
         ext = tldextract.extract(domain)
         suffix = f".{ext.suffix}" if ext.suffix else ""
         if suffix in self.suspicious_tlds:
-            score -= 25
-            issues.append("Suspicious top-level domain")
+            score -= 20
+            issues.append("Suspicious TLD")
 
+        # Other checks
         if self._is_ip(domain):
-            score -= 30
-            issues.append("URL uses IP address instead of domain")
+            score -= 25
+            issues.append("IP-based domain")
 
         if self._looks_punycode(domain):
-            score -= 25
-            issues.append("Punycode domain detected")
+            score -= 20
+            issues.append("Punycode domain")
 
         if len(domain) > 35:
-            score -= 10
-            issues.append("Very long domain name")
+            score -= 8
+            issues.append("Very long domain")
         elif len(domain) > 25:
-            score -= 5
-            issues.append("Long domain name")
+            score -= 4
+            issues.append("Long domain")
 
-        # Typosquatting vs known brands
         if self._similar_to_brand(domain):
             score -= 25
-            issues.append("Possible typosquatting against known brand")
+            issues.append("Possible typosquatting / brand impersonation")
 
-        # Domain age (if available)
+        # Domain age
         age_days = self._domain_age_days(domain)
         if age_days is not None:
             if age_days < 90:
-                score -= 20
-                issues.append("Newly registered domain (<90 days)")
+                score -= 15
+                issues.append("Newly created domain (<90d)")
             elif age_days < 365:
-                score -= 10
-                issues.append("Young domain (<1 year)")
+                score -= 8
+                issues.append("Young domain (<1y)")
 
-        return max(0, score), issues
-    
+        score = max(0, score)
+        self.domain_cache[domain] = (score, issues, now)
+        log(f"📊 Domain {domain} score: {score}, issues: {len(issues)}")
+        return score, issues
+
     def analyze_content(self, content):
-        """Analyze email content for phishing patterns"""
+        if not content:
+            return 50, ["No content"]
+        
+        text = content.strip()
         score = 100
         issues = []
-        
-        if not content:
-            return 50, ["No content to analyze"]
-        
-        # Check for phishing patterns
-        pattern_matches = 0
-        for pattern in self.phishing_patterns:
-            if re.search(pattern, content, re.IGNORECASE):
-                pattern_matches += 1
-        
-        if pattern_matches > 0:
-            score -= min(pattern_matches * 15, 60)
-            issues.append(f"Found {pattern_matches} phishing pattern(s)")
-        
-        # Grammar and spelling check (if available)
-        if self.grammar_tool and LANGUAGE_TOOL_AVAILABLE:
+
+        # Check phishing patterns
+        matches = 0
+        for p in self.phishing_patterns:
+            if re.search(p, text, flags=re.IGNORECASE):
+                matches += 1
+
+        if matches > 0:
+            score -= min(60, matches * 12)
+            issues.append(f"Found {matches} phishing pattern(s)")
+
+        # Grammar check
+        if self.grammar_tool:
             try:
-                matches = self.grammar_tool.check(content[:1000])  # Limit to first 1000 chars
-                if len(matches) > 5:
-                    score -= min(len(matches) * 2, 20)
-                    issues.append(f"Poor grammar/spelling ({len(matches)} errors)")
+                g = self.grammar_tool.check(text[:2000])
+                cnt = len(g)
+                if cnt > 6:
+                    score -= min(20, cnt * 2)
+                    issues.append(f"Grammar/spelling issues: {cnt}")
             except Exception as e:
-                print(f"Grammar check failed: {e}")
-    
-        # Reading level check (if available)
+                log("Grammar check error:", e)
+
+        # Reading ease
         if TEXTSTAT_AVAILABLE:
             try:
-                reading_ease = flesch_reading_ease(content)
-                if reading_ease < 30:  # Very difficult to read
-                    score -= 10
-                    issues.append("Unusually complex language")
-            except Exception as e:
-                print(f"Reading ease check failed: {e}")
-    
-        # Check for excessive urgency words
-        urgency_words = ['urgent', 'immediate', 'asap', 'hurry', 'quick', 'fast', 'now', 'today']
-        urgency_count = sum(1 for word in urgency_words if word in content.lower())
-        if urgency_count > 3:
-            score -= 15
-            issues.append("Excessive urgency language")
-        
-        # Excessive links in content (heuristic on plain text)
-        link_count = len(re.findall(r'http[s]?://', content, re.IGNORECASE))
-        if link_count >= 3:
+                ease = flesch_reading_ease(text)
+                if ease < 25:
+                    score -= 8
+                    issues.append("Very low reading ease")
+            except Exception:
+                pass
+
+        # Urgency language
+        urgency_words = ['urgent','immediate','asap','hurry','quick','now','today','immediately']
+        urgency_count = sum(1 for w in urgency_words if w in text.lower())
+        if urgency_count >= 2:
             score -= 10
-            issues.append("Multiple links present")
-        
+            issues.append(f"Urgency language ({urgency_count})")
+
+        # Multiple links
+        link_count = len(re.findall(r'https?://', text, flags=re.IGNORECASE))
+        if link_count >= 3:
+            score -= 8
+            issues.append(f"Multiple links ({link_count})")
+
+        log(f"📝 Content analysis score: {score}, issues: {len(issues)}")
         return max(0, score), issues
-    
-    def analyze_urls(self, urls: list[str]) -> tuple[int, list[str]]:
+
+    def extract_urls(self, text):
+        if not text:
+            return []
+        
+        urls = re.findall(r'https?://[^\s<>"\'\)\]]+', text, flags=re.IGNORECASE)
+        hrefs = re.findall(r'href=[\'"]([^\'"]+)[\'"]', text, flags=re.IGNORECASE)
+        found = set()
+        
+        for u in urls + hrefs:
+            try:
+                u_dec = unquote(u).strip()
+            except Exception:
+                u_dec = u.strip()
+            if u_dec.lower().startswith('mailto:'):
+                continue
+            if not re.match(r'^https?://', u_dec, flags=re.IGNORECASE):
+                continue
+            found.add(u_dec)
+        
+        return list(found)
+
+    def analyze_urls(self, urls):
         if not urls:
             return 100, []
 
-        overall_issues: list[str] = []
-        per_url_scores: list[int] = []
+        overall_issues = []
+        per_scores = []
 
         for url in urls:
             url_score = 100
             try:
                 parsed = urlparse(url)
                 scheme = (parsed.scheme or '').lower()
-                domain = (parsed.netloc or '').lower()
+                host = (parsed.hostname or '').lower()
 
-                # Reputation of URL domain
-                d_score, d_issues = self.check_domain_reputation(domain)
-                overall_issues.extend([f"{domain}: {i}" for i in d_issues])
+                # Check domain reputation
+                d_score, d_issues = self.check_domain_reputation(host)
+                overall_issues.extend([f"{host}: {i}" for i in d_issues])
                 if d_score < 80:
-                    url_score -= min(30, 100 - d_score)
+                    url_score -= min(40, 100 - d_score)
 
-                # HTTPS required
+                # HTTPS check
                 if scheme != 'https':
-                    url_score -= 10
-                    overall_issues.append("Non-HTTPS link")
+                    url_score -= 8
+                    overall_issues.append(f"{host}: Non-HTTPS link")
 
-                # Suspicious URL constructs
-                full = url.lower()
-                if '@' in full:
-                    url_score -= 15
-                    overall_issues.append("URL contains @ (obfuscation)")
+                # Other URL checks
+                if '@' in url:
+                    url_score -= 12
+                    overall_issues.append(f"{host}: @ in URL (obfuscation)")
 
-                if self._is_ip(domain):
-                    url_score -= 15
-                    overall_issues.append("IP-based link")
+                if self._is_ip(host):
+                    url_score -= 12
+                    overall_issues.append(f"{host}: IP used instead of domain")
 
-                # Shorteners penalized more
-                if any(s in domain for s in self.shorteners):
-                    url_score -= 20
-                    overall_issues.append("URL shortener detected")
+                if any(s in host for s in self.shorteners):
+                    url_score -= 18
+                    overall_issues.append(f"{host}: URL shortener detected")
 
-                # Long / deep path
-                if len(full) > 120:
-                    url_score -= 5
-                    overall_issues.append("Unusually long URL")
-                if parsed.path.count('/') > 6:
-                    url_score -= 5
-                    overall_issues.append("Deep URL path structure")
+                # External reputation check
+                adj, rep_issues = self._check_external_reputation(url, host)
+                url_score += adj
+                overall_issues.extend(rep_issues)
 
-                # Suspicious query params
-                suspicious_params = ['login', 'verify', 'password', 'account', 'update', 'reset', 'pin']
-                if any(p in (parsed.query or '').lower() for p in suspicious_params):
-                    url_score -= 10
-                    overall_issues.append("Suspicious query parameters")
-
-                # Optional external reputation (if enabled)
-                adj, rep_issues = self._check_external_reputation(url, domain)
-                if adj != 0:
-                    url_score += adj
-                    overall_issues.extend(rep_issues)
-
-            except Exception:
-                url_score -= 20
+            except Exception as e:
+                log("URL analyze exception:", e)
+                url_score -= 30
                 overall_issues.append(f"Malformed URL: {url}")
 
-            per_url_scores.append(max(0, url_score))
+            per_scores.append(max(0, url_score))
 
-        # Be strict: take the minimum score across all URLs in the email
-        final_url_score = max(0, min(per_url_scores))
-        return final_url_score, overall_issues
-    
+        final = max(0, min(per_scores))
+        log(f"🔗 URL analysis score: {final}, issues: {len(overall_issues)}")
+        return final, overall_issues
+
     def check_whitelist(self, sender_email, sender_domain, content):
-        """Check if email components are whitelisted"""
         try:
-            conn = self.get_db_connection()
+            conn = get_db_connection()
             
             # Check sender email
-            result = conn.execute(
-                "SELECT * FROM whitelist WHERE type = 'email' AND value = ?",
-                (sender_email,)
-            ).fetchone()
-            if result:
+            row = conn.execute("SELECT * FROM whitelist WHERE type='email' AND value=?", (sender_email,)).fetchone()
+            if row:
                 conn.close()
-                return True, "Sender email is whitelisted"
+                return True, "Sender email whitelisted"
             
             # Check sender domain
-            result = conn.execute(
-                "SELECT * FROM whitelist WHERE type = 'domain' AND value = ?",
-                (sender_domain,)
-            ).fetchone()
-            if result:
+            row = conn.execute("SELECT * FROM whitelist WHERE type='domain' AND value=?", (sender_domain,)).fetchone()
+            if row:
                 conn.close()
-                return True, "Sender domain is whitelisted"
+                return True, "Sender domain whitelisted"
             
             # Check keywords
-            keywords = conn.execute(
-                "SELECT value FROM whitelist WHERE type = 'keyword'"
-            ).fetchall()
-            
-            for keyword_row in keywords:
-                if keyword_row['value'].lower() in content.lower():
+            rows = conn.execute("SELECT value FROM whitelist WHERE type='keyword'").fetchall()
+            for r in rows:
+                if r['value'].lower() in (content or '').lower():
                     conn.close()
-                    return True, f"Whitelisted keyword found: {keyword_row['value']}"
+                    return True, f"Whitelisted keyword found: {r['value']}"
             
             conn.close()
-            return False, ""
         except Exception as e:
-            print(f"Whitelist check failed: {e}")
-            return False, ""
-    
+            log("Whitelist check failed:", e)
+        
+        return False, ""
+
     def analyze_email(self, email_data):
-        """Main email analysis function"""
         try:
-            sender_email = email_data.get('sender', '')
-            subject = email_data.get('subject', '')
-            content = email_data.get('content', '')
+            sender = (email_data.get('sender') or '').strip()
+            subject = (email_data.get('subject') or '').strip()
+            content = (email_data.get('content') or '').strip()
+            combined = " ".join([subject, content]).strip()
+
+            log(f"🔍 Analyzing email from: {sender}")
+            log(f"📧 Subject: {subject[:50]}...")
+            log(f"📝 Content length: {len(content)}")
+
+            # Extract sender domain
+            sender_domain = ''
+            if '@' in sender:
+                sender_domain = sender.split('@')[-1].lower().split(':')[0]
             
-            print(f"🔍 Analyzing email from: {sender_email}")
-            
-            # Extract domain from sender
-            sender_domain = sender_email.split('@')[-1] if '@' in sender_email else ''
-            
-            # Check whitelist first
-            is_whitelisted, whitelist_reason = self.check_whitelist(sender_email, sender_domain, content)
-            if is_whitelisted:
-                print(f"✅ Email whitelisted: {whitelist_reason}")
-                return {
-                    'score': 100,
-                    'verdict': 'SAFE',
-                    'reason': whitelist_reason,
-                    'details': {'whitelisted': True}
-                }
-            
+            log(f"🌐 Sender domain: {sender_domain}")
+
+            # Check whitelist
+            wh, reason = self.check_whitelist(sender, sender_domain, combined)
+            if wh:
+                log(f"✅ Email whitelisted: {reason}")
+                return {'score': 100, 'verdict': 'SAFE', 'reason': reason, 'details': {'whitelisted': True}}
+
             # Extract URLs
             urls = self.extract_urls(content)
-            
+            log(f"🔗 Found {len(urls)} URLs")
+
             # Perform analysis
             domain_score, domain_issues = self.check_domain_reputation(sender_domain) if sender_domain else (40, ["No sender domain"])
-            content_score, content_issues = self.analyze_content(content + ' ' + subject)
+            content_score, content_issues = self.analyze_content(combined)
             url_score, url_issues = self.analyze_urls(urls)
-            
-            # Calculate weighted final score
-            final_score = int((domain_score * 0.35 + content_score * 0.4 + url_score * 0.25))
-            
-            # Determine verdict
-            if final_score >= 70:
-                verdict = 'SAFE'
-            elif final_score >= 50:
-                verdict = 'SUSPICIOUS'
-            else:
-                verdict = 'UNSAFE'
-            
-            # Compile analysis details
+
+            log(f"📊 Scores -> domain: {domain_score}, content: {content_score}, urls: {url_score}")
+
+            # Calculate final score
+            final_score = int((domain_score * 0.35) + (content_score * 0.45) + (url_score * 0.20))
+            verdict = 'SAFE' if final_score >= 70 else ('SUSPICIOUS' if final_score >= 50 else 'UNSAFE')
+
+            # Compile all issues
             all_issues = domain_issues + content_issues + url_issues
-            
-            analysis_result = {
-                'score': final_score,
-                'verdict': verdict,
-                'details': {
-                    'domain_score': domain_score,
-                    'content_score': content_score,
-                    'url_score': url_score,
-                    'issues': all_issues,
-                    'urls_found': urls,
-                    'sender_domain': sender_domain
-                }
+
+            details = {
+                'domain_score': domain_score, 'domain_issues': domain_issues,
+                'content_score': content_score, 'content_issues': content_issues,
+                'url_score': url_score, 'url_issues': url_issues,
+                'urls_found': urls, 'sender_domain': sender_domain,
+                'issues': all_issues
             }
-            
-            print(f"📊 Analysis complete: {verdict} ({final_score}%)")
-            
+
+            analysis_result = {'score': final_score, 'verdict': verdict, 'details': details}
+
+            log(f"✅ Analysis complete: {verdict} ({final_score}%)")
+
             # Store in database
             self.store_analysis(email_data, analysis_result)
-            
+
             return analysis_result
-            
+
         except Exception as e:
-            print(f"❌ Analysis error: {e}")
-            return {
-                'score': 50,
-                'verdict': 'ERROR',
-                'details': {'error': str(e)}
-            }
-    
-    def store_analysis(self, email_data, analysis_result):
-        """Store analysis results in database"""
+            log(f"❌ Analysis error: {e}")
+            return {'score': 50, 'verdict': 'ERROR', 'details': {'error': str(e)}}
+
+    def store_analysis(self, email_data, analysis_result, max_retries=5):
+        """Store analysis with enhanced debugging and validation"""
+        conn = None
         try:
-            conn = self.get_db_connection()
+            conn = get_db_connection()
+            cur = conn.cursor()
+        
+            # Extract and validate data with better fallbacks
+            sender_email = (email_data.get('sender') or '').strip()
+            subject = (email_data.get('subject') or '').strip()
+            content = (email_data.get('content') or '').strip()
+        
+            # Enhanced sender domain extraction
+            sender_domain = analysis_result['details'].get('sender_domain', '')
+            if not sender_domain and '@' in sender_email:
+                try:
+                    sender_domain = sender_email.split('@')[-1].lower().split(':')[0]
+                except Exception:
+                    sender_domain = 'unknown'
+            elif not sender_domain:
+                sender_domain = 'unknown'
+        
+            log(f"💾 STORAGE DEBUG:")
+            log(f"   📧 Sender: '{sender_email}'")
+            log(f"   🌐 Domain: '{sender_domain}'") 
+            log(f"   📝 Subject: '{subject[:50]}...'")
+            log(f"   📊 Score: {analysis_result['score']}")
+            log(f"   ⚖️  Verdict: {analysis_result['verdict']}")
+        
+            # Generate unique email ID
+            email_id = generate_unique_email_id(email_data)
+            log(f"   🆔 Email ID: {email_id}")
+        
+            # Prepare data for insertion
+            urls_json = json.dumps(analysis_result['details'].get('urls_found', []))
+            details_json = json.dumps(analysis_result['details'])
+        
+            # Insert with detailed error handling
+            try:
+                cur.execute('''
+                    INSERT INTO email_analysis
+                    (email_id, sender_email, sender_domain, subject, content_preview, urls, score, verdict, analysis_details, timestamp)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+                ''', (
+                    email_id,
+                    sender_email,
+                    sender_domain,
+                    subject[:200] if subject else '',
+                    content[:500] if content else '',
+                    urls_json,
+                    analysis_result['score'],
+                    analysis_result['verdict'],
+                    details_json
+                ))
             
-            email_id = hashlib.md5(
-                (email_data.get('sender', '') + email_data.get('subject', '') + 
-                 str(datetime.now())).encode()
-            ).hexdigest()
+                conn.commit()
             
-            conn.execute('''
-                INSERT OR REPLACE INTO email_analysis 
-                (email_id, sender_email, sender_domain, subject, content_preview, 
-                 urls, score, verdict, analysis_details)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (
-                email_id,
-                email_data.get('sender', ''),
-                analysis_result['details'].get('sender_domain', ''),
-                email_data.get('subject', ''),
-                email_data.get('content', '')[:200],
-                json.dumps(analysis_result['details'].get('urls_found', [])),
-                analysis_result['score'],
-                analysis_result['verdict'],
-                json.dumps(analysis_result['details'])
-            ))
+                # Verify insertion
+                verify = cur.execute("SELECT COUNT(*) FROM email_analysis WHERE email_id = ?", (email_id,)).fetchone()[0]
+                if verify > 0:
+                    log(f"✅ STORAGE SUCCESS: Email stored and verified in database")
+                
+                    # Get total count for verification
+                    total = cur.execute("SELECT COUNT(*) FROM email_analysis").fetchone()[0]
+                    log(f"📊 Total emails in database: {total}")
+                else:
+                    log(f"❌ STORAGE FAILED: Email not found after insertion")
+                
+            except sqlite3.IntegrityError as e:
+                log(f"⚠️ STORAGE INTEGRITY ERROR: {e}")
+                # Try with a different ID
+                email_id = f"{email_id}_{int(time.time())}"
+                cur.execute('''
+                    INSERT INTO email_analysis
+                    (email_id, sender_email, sender_domain, subject, content_preview, urls, score, verdict, analysis_details, timestamp)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+                ''', (
+                    email_id, sender_email, sender_domain, subject[:200] if subject else '',
+                    content[:500] if content else '', urls_json, analysis_result['score'],
+                    analysis_result['verdict'], details_json
+                ))
+                conn.commit()
+                log(f"✅ STORAGE SUCCESS: Stored with modified ID: {email_id}")
             
-            conn.commit()
-            conn.close()
         except Exception as e:
-            print(f"Failed to store analysis: {e}")
+            log(f"❌ STORAGE ERROR: {e}")
+            import traceback
+            log(f"📋 Full traceback: {traceback.format_exc()}")
+        finally:
+            if conn:
+                conn.close()
 
 # Initialize detector
 detector = PhishingDetector()
 
+# Flask app
+app = Flask(__name__)
+CORS(app)
+
 @app.route('/')
 def index():
-    return render_template('index.html')
+    try:
+        return render_template('index.html')
+    except Exception:
+        return "PhishNet API"
 
 @app.route('/api/analyze', methods=['POST'])
 def analyze_email():
-    """API endpoint to analyze email"""
     try:
         email_data = request.json
         if not email_data:
             return jsonify({'error': 'No email data provided'}), 400
         
+        log(f"📨 API received email data: {email_data.get('sender', 'No sender')}")
         result = detector.analyze_email(email_data)
         return jsonify(result)
-    
     except Exception as e:
-        print(f"API error: {e}")
+        log(f"❌ API analyze error: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/whitelist', methods=['GET', 'POST', 'DELETE'])
 def manage_whitelist():
-    """Manage whitelist entries"""
     try:
-        conn = detector.get_db_connection()
+        conn = get_db_connection()
         
         if request.method == 'GET':
-            entries = conn.execute(
-                "SELECT * FROM whitelist ORDER BY type, value"
-            ).fetchall()
+            rows = conn.execute("SELECT * FROM whitelist ORDER BY type, value").fetchall()
             conn.close()
-            return jsonify([dict(entry) for entry in entries])
+            return jsonify([dict(r) for r in rows])
         
         elif request.method == 'POST':
-            data = request.json
-            try:
-                conn.execute(
-                    "INSERT INTO whitelist (type, value, notes) VALUES (?, ?, ?)",
-                    (data['type'], data['value'], data.get('notes', ''))
-                )
-                conn.commit()
-                conn.close()
-                return jsonify({'success': True})
-            except sqlite3.IntegrityError:
-                conn.close()
-                return jsonify({'error': 'Entry already exists'}), 400
-        
-        elif request.method == 'DELETE':
-            entry_id = request.args.get('id')
-            conn.execute("DELETE FROM whitelist WHERE id = ?", (entry_id,))
+            data = request.json or {}
+            conn.execute("INSERT INTO whitelist (type, value, notes) VALUES (?, ?, ?)", 
+                        (data['type'], data['value'], data.get('notes','')))
             conn.commit()
             conn.close()
             return jsonify({'success': True})
-    
+        
+        elif request.method == 'DELETE':
+            entry_id = request.args.get('id')
+            conn.execute("DELETE FROM whitelist WHERE id=?", (entry_id,))
+            conn.commit()
+            conn.close()
+            return jsonify({'success': True})
+            
+    except sqlite3.IntegrityError:
+        return jsonify({'error': 'Entry already exists'}), 400
     except Exception as e:
-        print(f"Whitelist API error: {e}")
+        log(f"❌ Whitelist API error: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/history')
 def get_analysis_history():
-    """Get analysis history"""
     try:
-        conn = detector.get_db_connection()
+        conn = get_db_connection()
         page = int(request.args.get('page', 1))
         per_page = int(request.args.get('per_page', 20))
         offset = (page - 1) * per_page
         
-        entries = conn.execute(
-            "SELECT * FROM email_analysis ORDER BY timestamp DESC LIMIT ? OFFSET ?",
+        rows = conn.execute(
+            "SELECT * FROM email_analysis ORDER BY timestamp DESC LIMIT ? OFFSET ?", 
             (per_page, offset)
         ).fetchall()
         
         total = conn.execute("SELECT COUNT(*) FROM email_analysis").fetchone()[0]
         conn.close()
         
+        log(f"📋 History API returning {len(rows)} entries (total: {total})")
         return jsonify({
-            'entries': [dict(entry) for entry in entries],
-            'total': total,
-            'page': page,
+            'entries': [dict(r) for r in rows], 
+            'total': total, 
+            'page': page, 
             'per_page': per_page
         })
     except Exception as e:
-        print(f"History API error: {e}")
+        log(f"❌ History API error: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/stats')
 def get_stats():
-    """Get dashboard statistics"""
     try:
-        conn = detector.get_db_connection()
-        
-        total_analyzed = conn.execute("SELECT COUNT(*) FROM email_analysis").fetchone()[0]
-        safe_count = conn.execute("SELECT COUNT(*) FROM email_analysis WHERE verdict = 'SAFE'").fetchone()[0]
-        suspicious_count = conn.execute("SELECT COUNT(*) FROM email_analysis WHERE verdict = 'SUSPICIOUS'").fetchone()[0]
-        unsafe_count = conn.execute("SELECT COUNT(*) FROM email_analysis WHERE verdict = 'UNSAFE'").fetchone()[0]
+        conn = get_db_connection()
+        total = conn.execute("SELECT COUNT(*) FROM email_analysis").fetchone()[0]
+        safe = conn.execute("SELECT COUNT(*) FROM email_analysis WHERE verdict='SAFE'").fetchone()[0]
+        susp = conn.execute("SELECT COUNT(*) FROM email_analysis WHERE verdict='SUSPICIOUS'").fetchone()[0]
+        unsafe = conn.execute("SELECT COUNT(*) FROM email_analysis WHERE verdict='UNSAFE'").fetchone()[0]
         whitelist_count = conn.execute("SELECT COUNT(*) FROM whitelist").fetchone()[0]
+        conn.close()
+        
+        return jsonify({
+            'total_analyzed': total, 
+            'safe_count': safe, 
+            'suspicious_count': susp, 
+            'unsafe_count': unsafe, 
+            'whitelist_count': whitelist_count
+        })
+    except Exception as e:
+        log(f"❌ Stats API error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/debug/recent-analyses')
+def debug_recent_analyses():
+    """Debug endpoint to see recent database entries with full details"""
+    try:
+        conn = get_db_connection()
+        rows = conn.execute("""
+            SELECT email_id, sender_email, sender_domain, subject, score, verdict, timestamp,
+                   LENGTH(content_preview) as content_length,
+                   LENGTH(analysis_details) as details_length
+            FROM email_analysis 
+            ORDER BY timestamp DESC 
+            LIMIT 50
+        """).fetchall()
+        conn.close()
+        
+        return jsonify({
+            'total_found': len(rows),
+            'entries': [dict(r) for r in rows]
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/debug/database-info')
+def debug_database_info():
+    """Debug endpoint to show database schema and counts"""
+    try:
+        conn = get_db_connection()
+        
+        # Get table info
+        schema = conn.execute("PRAGMA table_info(email_analysis)").fetchall()
+        
+        # Get counts by verdict
+        verdicts = conn.execute("""
+            SELECT verdict, COUNT(*) as count 
+            FROM email_analysis 
+            GROUP BY verdict
+        """).fetchall()
+        
+        # Get recent entries with more details
+        recent = conn.execute("""
+            SELECT email_id, sender_email, sender_domain, subject, score, verdict, 
+                   datetime(timestamp, 'localtime') as local_time,
+                   CASE 
+                       WHEN sender_email = '' THEN 'MISSING_SENDER'
+                       WHEN sender_domain = '' THEN 'MISSING_DOMAIN' 
+                       WHEN subject = '' THEN 'MISSING_SUBJECT'
+                       ELSE 'OK'
+                   END as data_status
+            FROM email_analysis 
+            ORDER BY timestamp DESC 
+            LIMIT 20
+        """).fetchall()
         
         conn.close()
         
         return jsonify({
-            'total_analyzed': total_analyzed,
-            'safe_count': safe_count,
-            'suspicious_count': suspicious_count,
-            'unsafe_count': unsafe_count,
-            'whitelist_count': whitelist_count
+            'schema': [dict(r) for r in schema],
+            'verdict_counts': [dict(r) for r in verdicts],
+            'recent_entries': [dict(r) for r in recent],
+            'database_path': DB_PATH
         })
     except Exception as e:
-        print(f"Stats API error: {e}")
         return jsonify({'error': str(e)}), 500
 
-# Serve Chrome extension files
+@app.route('/api/debug/test-storage', methods=['POST'])
+def debug_test_storage():
+    """Test endpoint to manually store a test email"""
+    try:
+        test_email = {
+            'sender': 'test@gmail.com',
+            'subject': 'Test Email from Debug Endpoint',
+            'content': 'This is a test email to verify storage is working correctly.'
+        }
+        
+        log("🧪 Debug: Testing email storage...")
+        result = detector.analyze_email(test_email)
+        
+        return jsonify({
+            'test_email': test_email,
+            'analysis_result': result,
+            'message': 'Test email analyzed and should be stored'
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/extension/<path:filename>')
 def serve_extension(filename):
     return send_from_directory('extension', filename)
 
-if __name__ == '__main__':
-    # Ensure database is set up
-    if not os.path.exists('data/phishing_detector.db'):
-        try:
-            from scripts.setup_database import setup_database
-            setup_database()
-        except Exception as e:
-            print(f"Database setup failed: {e}")
+if __name__ == "__main__":
+    log("🚀 Starting PhishNet with enhanced debugging...")
+    log(f"📊 Debug mode: {DEBUG}")
+    log(f"🔗 External checks: {ENABLE_EXTERNAL_CHECKS}")
     
-    print("🚀 Starting Phishing Email Detector Backend...")
-    print("📊 Dashboard: http://localhost:5000")
-    print("🔌 API: http://localhost:5000/api/")
-    
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    app.run(host='0.0.0.0', port=int(os.getenv("PORT", 5000)), debug=False)

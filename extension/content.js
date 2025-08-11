@@ -1,4 +1,4 @@
-// Enhanced content script for email detection with Unicode support + top banner
+// Enhanced content script for email detection with better Gmail/Outlook extraction
 const SHOW_INLINE_BADGE = false
 
 class EmailDetector {
@@ -6,25 +6,29 @@ class EmailDetector {
     this.isGmail = window.location.hostname.includes("mail.google.com")
     this.isOutlook = window.location.hostname.includes("outlook")
     this.processedEmails = new Set()
-    this.processingEmails = new Set() // Prevent duplicate processing
-    this.chrome = window.chrome || window.browser // Support both Chrome and Firefox
+    this.processingEmails = new Set()
+    this.chrome = window.chrome || window.browser
     this.apiUrl = "http://localhost:5000"
-    this.isProcessing = false // Global processing flag
+    this.isProcessing = false
+    this.debugMode = true // Enable detailed debugging
     this.init()
-    // Expose instance for message handlers
     window.PhishNetDetector = this
   }
 
-  init() {
-    console.log("🛡️ PhishNet initialized on:", window.location.hostname)
+  debug(...args) {
+    if (this.debugMode) {
+      console.log("🛡️ PhishNet DEBUG:", ...args)
+    }
+  }
 
-    // Check if we're on a supported email platform
+  init() {
+    this.debug("Initialized on:", window.location.hostname)
+
     if (!this.isGmail && !this.isOutlook) {
-      console.log("❌ Unsupported email platform")
+      this.debug("❌ Unsupported email platform")
       return
     }
 
-    // Wait for page to fully load
     if (document.readyState === "loading") {
       document.addEventListener("DOMContentLoaded", () => {
         this.startMonitoring()
@@ -35,20 +39,15 @@ class EmailDetector {
   }
 
   startMonitoring() {
-    console.log("🔍 Starting email monitoring...")
+    this.debug("🔍 Starting email monitoring...")
 
-    // Process existing emails after a delay
     setTimeout(() => {
       this.processExistingEmails()
     }, 3000)
 
-    // Start monitoring for new emails
     this.startEmailMonitoring()
-
-    // Monitor for URL changes (Gmail SPA navigation)
     this.monitorUrlChanges()
 
-    // Listen for background-triggered banner requests (optional)
     this.chrome.runtime.onMessage.addListener((request) => {
       if (request.action === "showBanner" && request.result) {
         this.showTopBanner(request.result)
@@ -60,14 +59,13 @@ class EmailDetector {
     let mutationTimeout = null
 
     const observer = new MutationObserver((mutations) => {
-      // Debounce mutations to prevent excessive processing
       if (mutationTimeout) {
         clearTimeout(mutationTimeout)
       }
 
       mutationTimeout = setTimeout(() => {
         if (this.isProcessing) {
-          console.log("⏳ Already processing, skipping...")
+          this.debug("⏳ Already processing, skipping...")
           return
         }
 
@@ -83,10 +81,10 @@ class EmailDetector {
         })
 
         if (shouldCheck) {
-          console.log("🔄 New email elements detected, processing...")
+          this.debug("🔄 New email elements detected, processing...")
           this.processExistingEmails()
         }
-      }, 800) // 0.8s debounce
+      }, 800)
     })
 
     observer.observe(document.body, {
@@ -94,7 +92,7 @@ class EmailDetector {
       subtree: true,
     })
 
-    console.log("👀 MutationObserver started")
+    this.debug("👀 MutationObserver started")
   }
 
   isEmailElement(element) {
@@ -117,15 +115,12 @@ class EmailDetector {
   isFullEmailOpen() {
     try {
       if (this.isGmail) {
-        // Gmail opened email usually renders with .ii.gt in the read view
         return !!document.querySelector(".ii.gt")
       }
       if (this.isOutlook) {
-        // Outlook read pane detection (heuristic)
         return !!document.querySelector('[role="region"]') || !!document.querySelector(".ReadingPane")
       }
     } catch (_) {}
-    // Fallback: assume open
     return true
   }
 
@@ -137,9 +132,8 @@ class EmailDetector {
       const url = location.href
       if (url !== lastUrl) {
         lastUrl = url
-        console.log("📧 URL changed, scheduling email check...")
+        this.debug("📧 URL changed, scheduling email check...")
 
-        // Debounce URL changes
         if (urlChangeTimeout) {
           clearTimeout(urlChangeTimeout)
         }
@@ -155,18 +149,19 @@ class EmailDetector {
 
   async processExistingEmails() {
     if (this.isProcessing) {
-      console.log("⏳ Already processing emails, skipping...")
+      this.debug("⏳ Already processing emails, skipping...")
       return
     }
 
     this.isProcessing = true
-    console.log("🔍 Processing existing emails...")
+    this.debug("🔍 Processing existing emails...")
 
     try {
       let emailElements = []
 
       if (this.isGmail) {
-        // More specific Gmail selectors to avoid duplicates
+        this.debug("📧 Gmail: Looking for email elements...")
+
         const selectors = [
           "[data-message-id]:not(.phishing-processed)",
           ".ii.gt:not(.phishing-processed)",
@@ -175,38 +170,43 @@ class EmailDetector {
 
         selectors.forEach((selector) => {
           const elements = document.querySelectorAll(selector)
+          this.debug(`   Found ${elements.length} elements with selector: ${selector}`)
           emailElements.push(...elements)
         })
+
+        // Additional Gmail debugging
+        this.debug("📧 Gmail DOM Analysis:")
+        this.debug("   - Message containers:", document.querySelectorAll("[data-message-id]").length)
+        this.debug("   - Email bodies:", document.querySelectorAll(".ii.gt").length)
+        this.debug("   - Thread items:", document.querySelectorAll('[role="listitem"]').length)
+        this.debug("   - Sender elements:", document.querySelectorAll("[email]").length)
+        this.debug("   - Subject elements:", document.querySelectorAll("h2[data-thread-perm-id]").length)
       } else if (this.isOutlook) {
         emailElements = [
           ...document.querySelectorAll("[data-convid]:not(.phishing-processed)"),
           ...document.querySelectorAll(".rps_1aba:not(.phishing-processed)"),
+          ...document.querySelectorAll('[role="region"]:not(.phishing-processed)'),
         ]
       }
 
-      // Remove duplicates and filter out already processed
       emailElements = [...new Set(emailElements)].filter((el) => !el.classList.contains("phishing-processed"))
 
-      console.log(`📧 Found ${emailElements.length} new email elements`)
+      this.debug(`📧 Found ${emailElements.length} new email elements to process`)
 
       if (emailElements.length === 0) {
         this.isProcessing = false
         return
       }
 
-      // Process emails with staggered timing
       for (let i = 0; i < emailElements.length; i++) {
         const emailElement = emailElements[i]
-
-        // Mark as being processed to avoid duplicates
         emailElement.classList.add("phishing-processed")
 
         setTimeout(() => {
           this.processEmail(emailElement)
-        }, i * 350) // staggered
+        }, i * 350)
       }
 
-      // Reset processing flag after all emails are queued
       setTimeout(
         () => {
           this.isProcessing = false
@@ -221,49 +221,73 @@ class EmailDetector {
 
   async processEmail(emailElement) {
     try {
+      this.debug("🔍 Processing email element:", emailElement)
+
       const emailData = this.extractEmailData(emailElement)
 
+      this.debug("📧 Extracted email data:", {
+        sender: emailData.sender,
+        subject: emailData.subject?.substring(0, 50) + "...",
+        contentLength: emailData.content?.length || 0,
+        hasValidData: !!(emailData.sender && emailData.content && emailData.content.length > 10),
+      })
+
       if (!emailData || !emailData.content || emailData.content.length < 10) {
-        console.log("⚠️ Insufficient email data, skipping")
+        this.debug("⚠️ Insufficient email data, skipping analysis")
+        this.debug("   - Sender:", emailData?.sender || "missing")
+        this.debug("   - Subject:", emailData?.subject || "missing")
+        this.debug("   - Content length:", emailData?.content?.length || 0)
         return
       }
 
       const emailId = this.generateEmailId(emailData)
 
-      // Check if already processed or currently processing
       if (this.processedEmails.has(emailId) || this.processingEmails.has(emailId)) {
+        this.debug("⏭️ Email already processed, skipping")
         return
       }
 
       this.processingEmails.add(emailId)
-      console.log("🔍 Analyzing email from:", emailData.sender)
+      this.debug("🔍 Analyzing email from:", emailData.sender)
 
-      // Add loading indicator
       this.addLoadingIndicator(emailElement)
 
-      // Test API connection
       const isApiAvailable = await this.testApiConnection()
       if (!isApiAvailable) {
+        this.debug("❌ API not available")
         this.removeLoadingIndicator(emailElement)
         this.showError(emailElement, "Backend not running")
         this.processingEmails.delete(emailId)
         return
       }
 
-      // Analyze email
       try {
+        this.debug("📤 Sending email data to API:", {
+          sender: emailData.sender,
+          subject: emailData.subject,
+          contentPreview: emailData.content.substring(0, 100) + "...",
+        })
+
         const result = await this.callAnalysisAPI(emailData)
+
+        this.debug("📥 Received analysis result:", {
+          score: result.score,
+          verdict: result.verdict,
+          hasDetails: !!result.details,
+        })
+
         this.removeLoadingIndicator(emailElement)
         this.displayAnalysisResult(emailElement, result)
         this.processedEmails.add(emailId)
-        console.log(`✅ Analysis complete for ${emailData.sender}: ${result.verdict} (${result.score}%)`)
 
-        // Show top-of-screen banner for opened/full email view
+        this.debug(`✅ Analysis complete for ${emailData.sender}: ${result.verdict} (${result.score}%)`)
+
         if (this.isFullEmailOpen()) {
           this.showTopBanner(result)
         }
       } catch (error) {
         console.error("❌ Analysis failed:", error)
+        this.debug("❌ Analysis API call failed:", error.message)
         this.removeLoadingIndicator(emailElement)
         this.showError(emailElement, "Analysis failed")
       }
@@ -271,6 +295,7 @@ class EmailDetector {
       this.processingEmails.delete(emailId)
     } catch (error) {
       console.error("❌ Error processing email:", error)
+      this.debug("❌ Email processing error:", error.message)
       this.removeLoadingIndicator(emailElement)
       this.showError(emailElement, "Processing error")
     }
@@ -287,8 +312,11 @@ class EmailDetector {
       })
 
       clearTimeout(timeoutId)
-      return response.ok
+      const isOk = response.ok
+      this.debug("🔗 API connection test:", isOk ? "✅ Success" : "❌ Failed")
+      return isOk
     } catch (error) {
+      this.debug("🔗 API connection test: ❌ Failed -", error.message)
       return false
     }
   }
@@ -298,6 +326,8 @@ class EmailDetector {
     const timeoutId = setTimeout(() => controller.abort(), 10000)
 
     try {
+      this.debug("📤 Making API call to /api/analyze")
+
       const response = await fetch(`${this.apiUrl}/api/analyze`, {
         method: "POST",
         headers: {
@@ -309,13 +339,18 @@ class EmailDetector {
 
       clearTimeout(timeoutId)
 
+      this.debug("📥 API response status:", response.status)
+
       if (!response.ok) {
         throw new Error(`HTTP error! status: ${response.status}`)
       }
 
-      return await response.json()
+      const result = await response.json()
+      this.debug("📥 API response data:", result)
+      return result
     } catch (error) {
       clearTimeout(timeoutId)
+      this.debug("❌ API call failed:", error.message)
       throw error
     }
   }
@@ -327,37 +362,150 @@ class EmailDetector {
 
     try {
       if (this.isGmail) {
-        // Gmail extraction with better targeting
+        this.debug("📧 Gmail: Starting email data extraction...")
+
+        // Enhanced Gmail extraction with multiple fallbacks
         const senderElement =
           emailElement.querySelector("[email]") ||
           emailElement.closest("[data-message-id]")?.querySelector("[email]") ||
-          document.querySelector(".gD[email]")
+          document.querySelector(".gD[email]") ||
+          document.querySelector(".go span[email]") ||
+          document.querySelector(".qu [email]") ||
+          document.querySelector(".yW span[email]")
 
-        const subjectElement = document.querySelector("h2[data-thread-perm-id]") || document.querySelector(".hP")
+        this.debug("📧 Gmail: Sender element found:", !!senderElement)
+        if (senderElement) {
+          this.debug("   - Element tag:", senderElement.tagName)
+          this.debug("   - Email attribute:", senderElement.getAttribute("email"))
+          this.debug("   - Text content:", senderElement.textContent)
+        }
 
-        sender = senderElement?.getAttribute("email") || ""
-        subject = subjectElement?.textContent?.trim() || ""
+        const subjectElement =
+          document.querySelector("h2[data-thread-perm-id]") ||
+          document.querySelector(".hP") ||
+          document.querySelector(".bog") ||
+          document.querySelector("span[data-thread-perm-id]") ||
+          document.querySelector(".qu .hP") ||
+          document.querySelector("[data-thread-perm-id] span")
 
-        // Get content more precisely
+        this.debug("📧 Gmail: Subject element found:", !!subjectElement)
+        if (subjectElement) {
+          this.debug("   - Element tag:", subjectElement.tagName)
+          this.debug("   - Text content:", subjectElement.textContent?.substring(0, 50))
+          this.debug("   - Title attribute:", subjectElement.getAttribute("title"))
+        }
+
+        sender =
+          senderElement?.getAttribute("email") || senderElement?.textContent?.match(/[\w.-]+@[\w.-]+\.\w+/)?.[0] || ""
+
+        subject = subjectElement?.textContent?.trim() || subjectElement?.getAttribute("title") || ""
+
+        // Enhanced content extraction for Gmail
         const contentElement =
-          emailElement.querySelector(".ii.gt div") || emailElement.querySelector(".ii.gt") || emailElement
+          emailElement.querySelector(".ii.gt div") ||
+          emailElement.querySelector(".ii.gt") ||
+          document.querySelector(".ii.gt") ||
+          document.querySelector(".a3s.aiL") ||
+          document.querySelector(".ii.gt .a3s") ||
+          emailElement
+
+        this.debug("📧 Gmail: Content element found:", !!contentElement)
+        if (contentElement) {
+          this.debug("   - Element tag:", contentElement.tagName)
+          this.debug("   - Class list:", contentElement.className)
+          this.debug("   - Content length:", contentElement.textContent?.length || 0)
+        }
 
         content = contentElement?.textContent?.trim() || ""
+
+        this.debug("📧 Gmail: Final extraction results:")
+        this.debug("   - Sender:", sender || "MISSING")
+        this.debug("   - Subject:", subject?.substring(0, 50) || "MISSING")
+        this.debug("   - Content length:", content.length)
+
+        // If we're missing critical data, try alternative extraction methods
+        if (!sender || !content) {
+          this.debug("📧 Gmail: Trying alternative extraction methods...")
+
+          // Try to get sender from different locations
+          if (!sender) {
+            const altSenderElements = [
+              document.querySelector(".gD[email]"),
+              document.querySelector(".go span[email]"),
+              document.querySelector(".qu [email]"),
+              document.querySelector('[data-hovercard-id*="@"]'),
+            ]
+
+            for (const el of altSenderElements) {
+              if (el) {
+                sender = el.getAttribute("email") || el.textContent?.match(/[\w.-]+@[\w.-]+\.\w+/)?.[0] || ""
+                if (sender) {
+                  this.debug("   - Found sender via alternative method:", sender)
+                  break
+                }
+              }
+            }
+          }
+
+          // Try to get content from different locations
+          if (!content || content.length < 20) {
+            const altContentElements = [
+              document.querySelector(".a3s.aiL"),
+              document.querySelector(".ii.gt .a3s"),
+              document.querySelector("[data-message-id] .a3s"),
+              document.querySelector(".adn.ads .a3s"),
+            ]
+
+            for (const el of altContentElements) {
+              if (el && el.textContent && el.textContent.length > content.length) {
+                content = el.textContent.trim()
+                this.debug("   - Found content via alternative method, length:", content.length)
+                break
+              }
+            }
+          }
+        }
       } else if (this.isOutlook) {
-        // Outlook extraction
+        // Outlook extraction (already working)
         const senderElement =
           emailElement.querySelector('[title*="@"]') ||
           emailElement.querySelector(".lpc_1aba") ||
-          document.querySelector('[data-testid="message-header-from"]')
+          document.querySelector('[data-testid="message-header-from"]') ||
+          document.querySelector('[aria-label*="From"]') ||
+          document.querySelector('.allowTextSelection[title*="@"]')
 
         const subjectElement =
           document.querySelector('[aria-label*="Subject"]') ||
           document.querySelector(".rps_1aba") ||
-          document.querySelector('[data-testid="message-subject"]')
+          document.querySelector('[data-testid="message-subject"]') ||
+          document.querySelector('div[role="heading"]') ||
+          document.querySelector('.allowTextSelection[title]:not([title*="@"])')
 
-        sender = senderElement?.textContent?.match(/[\w.-]+@[\w.-]+\.\w+/)?.[0] || ""
-        subject = subjectElement?.textContent?.trim() || ""
-        content = emailElement.textContent?.trim() || ""
+        if (senderElement) {
+          const titleAttr = senderElement.getAttribute("title")
+          const textContent = senderElement.textContent
+
+          sender =
+            titleAttr?.match(/[\w.-]+@[\w.-]+\.\w+/)?.[0] || textContent?.match(/[\w.-]+@[\w.-]+\.\w+/)?.[0] || ""
+        }
+
+        if (subjectElement) {
+          subject = subjectElement.textContent?.trim() || subjectElement.getAttribute("title") || ""
+        }
+
+        const contentElement =
+          document.querySelector('[data-testid="message-body"]') ||
+          document.querySelector(".rps_1aba") ||
+          document.querySelector('[role="region"]') ||
+          emailElement
+
+        content = contentElement?.textContent?.trim() || ""
+
+        this.debug("📧 Outlook extraction:", {
+          sender,
+          subject: subject.substring(0, 50),
+          contentLength: content.length,
+        })
       }
 
       // Clean and validate data
@@ -365,18 +513,18 @@ class EmailDetector {
       subject = this.cleanText(subject)
       content = this.cleanText(content)
 
-      // Only log if we have meaningful data
-      if (sender && content.length > 20) {
-        console.log("📧 Extracted email data:", {
-          sender,
-          subject: subject.substring(0, 30) + "...",
-          contentLength: content.length,
-        })
-      }
+      // Final validation and debugging
+      const isValid = sender && content.length > 20
+      this.debug("📧 Final extraction result:")
+      this.debug("   - Valid:", isValid)
+      this.debug("   - Sender:", sender || "MISSING")
+      this.debug("   - Subject:", subject?.substring(0, 30) + "..." || "MISSING")
+      this.debug("   - Content length:", content.length)
 
       return { sender, subject, content }
     } catch (error) {
-      console.error("Error extracting email data:", error)
+      console.error("❌ Error extracting email data:", error)
+      this.debug("❌ Email extraction error:", error.message)
       return { sender: "", subject: "", content: "" }
     }
   }
@@ -388,10 +536,8 @@ class EmailDetector {
 
   generateEmailId(emailData) {
     try {
-      // Create a simple hash without using btoa() to avoid Unicode issues
       const data = (emailData.sender || "") + (emailData.subject || "") + (emailData.content || "").substring(0, 100)
 
-      // Simple hash function that works with Unicode
       let hash = 0
       if (data.length === 0) {
         return Date.now().toString(36) + Math.random().toString(36).substr(2, 5)
@@ -400,21 +546,18 @@ class EmailDetector {
       for (let i = 0; i < data.length; i++) {
         const char = data.charCodeAt(i)
         hash = (hash << 5) - hash + char
-        hash = hash & hash // Convert to 32-bit integer
+        hash = hash & hash
       }
 
-      // Convert to positive number and then to base36 string
       const positiveHash = Math.abs(hash)
       return positiveHash.toString(36)
     } catch (error) {
       console.error("Error generating email ID:", error)
-      // Fallback to timestamp + random
       return Date.now().toString(36) + Math.random().toString(36).substr(2, 5)
     }
   }
 
   addLoadingIndicator(emailElement) {
-    // Don't add if already exists
     if (emailElement.querySelector(".phishing-detector-loading")) {
       return
     }
@@ -486,13 +629,11 @@ class EmailDetector {
 
   displayAnalysisResult(emailElement, result) {
     if (!SHOW_INLINE_BADGE) {
-      // Do not render the small badge at all
       return
     }
 
     this.removeLoadingIndicator(emailElement)
 
-    // Don't add if already exists
     if (emailElement.querySelector(".phishing-detector-result")) {
       return
     }
@@ -550,12 +691,11 @@ class EmailDetector {
   }
 
   showTopBanner(result) {
-    // Remove any existing banner
     const existing = document.getElementById("phishnet-top-banner")
     if (existing) existing.remove()
 
     const isSafe = result.verdict === "SAFE" && result.score >= 70
-    const isWarn = !isSafe // SUSPICIOUS or UNSAFE -> red banner
+    const isWarn = !isSafe
 
     const banner = document.createElement("div")
     banner.id = "phishnet-top-banner"
@@ -579,10 +719,8 @@ class EmailDetector {
       </div>
     `
 
-    // Insert into document
     document.body.appendChild(banner)
 
-    // Dismiss logic
     let autoDismissTimer = null
 
     const remove = () => {
@@ -597,7 +735,6 @@ class EmailDetector {
     const okBtn = banner.querySelector("#phishnet-ok-btn")
     if (okBtn) okBtn.addEventListener("click", remove)
 
-    // Auto-dismiss SAFE banner after 5 seconds
     if (isSafe) {
       autoDismissTimer = setTimeout(remove, 5000)
     }
@@ -694,12 +831,59 @@ class EmailDetector {
   }
 }
 
-// Make EmailDetector available globally for testing
+// Add manual testing functions to window for debugging
+window.PhishNetDebug = {
+  testExtraction: () => {
+    console.log("🧪 Testing Gmail extraction manually...")
+    const detector = window.PhishNetDetector
+    if (detector) {
+      detector.processExistingEmails()
+    } else {
+      console.log("❌ PhishNet detector not found")
+    }
+  },
+
+  inspectDOM: () => {
+    console.log("🔍 Gmail DOM Inspection:")
+    console.log("- Message containers:", document.querySelectorAll("[data-message-id]").length)
+    console.log("- Email bodies:", document.querySelectorAll(".ii.gt").length)
+    console.log("- Sender elements:", document.querySelectorAll("[email]").length)
+    console.log("- Subject elements:", document.querySelectorAll("h2[data-thread-perm-id]").length)
+
+    // Show actual elements
+    const senders = document.querySelectorAll("[email]")
+    console.log("📧 Found senders:")
+    senders.forEach((el, i) => {
+      console.log(`  ${i + 1}. ${el.getAttribute("email")} (${el.tagName})`)
+    })
+
+    const subjects = document.querySelectorAll("h2[data-thread-perm-id]")
+    console.log("📝 Found subjects:")
+    subjects.forEach((el, i) => {
+      console.log(`  ${i + 1}. ${el.textContent?.substring(0, 50)}... (${el.tagName})`)
+    })
+  },
+
+  testAPI: async () => {
+    console.log("🧪 Testing API connection...")
+    try {
+      const response = await fetch("http://localhost:5000/api/stats")
+      if (response.ok) {
+        const data = await response.json()
+        console.log("✅ API working:", data)
+      } else {
+        console.log("❌ API error:", response.status)
+      }
+    } catch (error) {
+      console.log("❌ API connection failed:", error.message)
+    }
+  },
+}
+
 window.EmailDetector = EmailDetector
 
-// Initialize with better error handling
 try {
-  console.log("🚀 Initializing PhishNet...")
+  console.log("🚀 Initializing PhishNet with enhanced Gmail debugging...")
 
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", () => {

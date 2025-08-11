@@ -31,7 +31,7 @@
       <header class="bg-white dark:bg-gray-800 shadow-sm border-b border-gray-200 dark:border-gray-700 transition-colors duration-200">
           <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
               <div class="flex justify-between items-center py-4">
-                  <div class="flex items-center">
+                  <div class="flex items-center cursor-pointer" onclick="refreshToHome()">
                       <i class="fas fa-shield-alt text-blue-600 dark:text-blue-400 text-2xl mr-3"></i>
                       <h1 class="text-2xl font-bold text-gray-900 dark:text-white">PhishNet</h1>
                   </div>
@@ -596,6 +596,7 @@
                       <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">
                           ${new Date(entry.timestamp).toLocaleString()}
                       </td>
+                      
                       <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900 dark:text-white">${entry.sender_email}</td>
                       <td class="px-6 py-4 text-sm text-gray-900 dark:text-white max-w-xs truncate">${entry.subject}</td>
                       <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900 dark:text-white">${entry.score}/100</td>
@@ -616,6 +617,16 @@
       function downloadExtension() {
           // Create a zip file with extension files
           alert('Extension download will be implemented. For now, you can manually copy the extension files from the /extension directory.');
+      }
+
+      // Refresh to home page when logo is clicked
+      function refreshToHome() {
+          // Show dashboard tab
+          showTab('dashboard');
+          // Reload dashboard data
+          loadDashboard();
+          // Scroll to top
+          window.scrollTo({ top: 0, behavior: 'smooth' });
       }
 
       // Initialize on page load
